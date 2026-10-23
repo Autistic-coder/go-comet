@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 def client_for(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("RFQ_DATABASE_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("SEED_DEMO_DATA", "false")
     from app import main
 
     importlib.reload(main)
@@ -75,4 +76,20 @@ def test_l1_trigger_only_extends_when_leader_changes(tmp_path, monkeypatch):
 
         winning_bid = bid(client, rfq_id, "Blue Dart", 900, start + timedelta(minutes=56))
         assert winning_bid.json()["current_close_at"].endswith("11:05:00+00:00")
+
+
+def test_demo_seed_exposes_portfolio_to_frontend(tmp_path, monkeypatch):
+    monkeypatch.setenv("RFQ_DATABASE_PATH", str(tmp_path / "demo.db"))
+    monkeypatch.setenv("SEED_DEMO_DATA", "true")
+    from app import main
+
+    importlib.reload(main)
+    with TestClient(main.app) as client:
+        auctions = client.get("/api/rfqs").json()
+        assert len(auctions) == 4
+        assert {auction["status"] for auction in auctions} == {"active", "scheduled", "closed", "force_closed"}
+        active = next(auction for auction in auctions if auction["status"] == "active")
+        detail = client.get(f"/api/rfqs/{active['id']}").json()
+        assert detail["bid_count"] == 4
+        assert detail["bids"][0]["supplier_name"] == "Rivigo Express"
 
