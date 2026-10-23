@@ -40,6 +40,10 @@ The repository includes a Render Blueprint and a production multi-stage Docker b
 
 The free Blueprint uses ephemeral SQLite storage, which is appropriate for a demo but can reset during a restart or redeploy. For durable production data, attach a persistent disk and set `RFQ_DATABASE_PATH=/data/rfq.db`, or migrate the schema to Render Postgres.
 
+## Deploy to Vercel
+
+`Dockerfile.vercel` packages the same React frontend and FastAPI backend as a Vercel container Function. It serves both from one origin on port 80. Vercel Functions are stateless, so the demo's SQLite data is temporary; use a Marketplace Postgres integration for durable production auctions.
+
 ## Auction behavior
 
 An auction can extend when a bid is submitted within the configured trigger window. Three trigger modes are supported:
