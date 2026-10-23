@@ -1,0 +1,2 @@
+"""GoComet British Auction API."""
+
