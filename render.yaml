@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: gocomet-british-auction
+    runtime: docker
+    plan: free
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: RFQ_DATABASE_PATH
+        value: /tmp/rfq.db

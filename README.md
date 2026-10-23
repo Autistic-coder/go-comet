@@ -32,6 +32,14 @@ npm run dev
 
 Open <http://localhost:5173>. Vite proxies `/api` to FastAPI on port 8000. For a separately deployed API, set `VITE_API_URL`.
 
+## Deploy to Render
+
+The repository includes a Render Blueprint and a production multi-stage Docker build. The container builds React, then serves the generated frontend and FastAPI API from one web service.
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Autistic-coder/go-comet)
+
+The free Blueprint uses ephemeral SQLite storage, which is appropriate for a demo but can reset during a restart or redeploy. For durable production data, attach a persistent disk and set `RFQ_DATABASE_PATH=/data/rfq.db`, or migrate the schema to Render Postgres.
+
 ## Auction behavior
 
 An auction can extend when a bid is submitted within the configured trigger window. Three trigger modes are supported:

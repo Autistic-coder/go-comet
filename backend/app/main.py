@@ -4,9 +4,12 @@ import json
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .database import connection, init_db
 from .schemas import BidCreate, RfqCreate
@@ -274,4 +277,20 @@ def submit_bid(rfq_id: int, payload: BidCreate) -> dict:
 
         updated = db.execute("SELECT * FROM rfqs WHERE id = ?", (rfq_id,)).fetchone()
         return serialize_detail(db, updated, submitted_at)
+
+
+# In production the Docker build places Vite's output here. API routes are
+# registered first so this SPA fallback can safely handle all remaining paths.
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+if FRONTEND_DIST.exists():
+    assets_dir = FRONTEND_DIST / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="frontend-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_frontend(full_path: str) -> FileResponse:
+        candidate = (FRONTEND_DIST / full_path).resolve()
+        if candidate.is_relative_to(FRONTEND_DIST.resolve()) and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(FRONTEND_DIST / "index.html")
 

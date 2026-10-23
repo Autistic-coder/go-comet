@@ -32,3 +32,9 @@ jobs:
           node-version: "22"
       - run: npm install
       - run: npm run build
+
+  production-container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag gocomet-british-auction:ci .
