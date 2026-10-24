@@ -53,32 +53,39 @@ class PostgresConnection:
         self.raw.rollback()
 
 
+def _configure_postgres_connection(raw: psycopg.Connection) -> None:
+    """Apply safety limits after connecting for hosted-pooler compatibility."""
+    timeout_ms = max(100, int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000")))
+    idle_ms = max(timeout_ms, int(os.getenv("DB_IDLE_TX_TIMEOUT_MS", "10000")))
+    raw.execute(
+        "SELECT set_config('statement_timeout', %s, false), "
+        "set_config('idle_in_transaction_session_timeout', %s, false), "
+        "set_config('application_name', 'gocomet_api', false)",
+        (str(timeout_ms), str(idle_ms)),
+    )
+    raw.commit()
+
+
 def postgres_pool() -> ConnectionPool:
     """Return a lazy, bounded pool suitable for serverless Fluid Compute reuse."""
     global _pool
     if _pool is None:
         max_size = max(1, int(os.getenv("DB_POOL_MAX_SIZE", "5")))
-        timeout_ms = max(100, int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000")))
-        idle_ms = max(timeout_ms, int(os.getenv("DB_IDLE_TX_TIMEOUT_MS", "10000")))
         _pool = ConnectionPool(
             conninfo=os.environ["DATABASE_URL"],
             min_size=0,
             max_size=max_size,
-            timeout=float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "5")),
+            timeout=float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "15")),
             max_lifetime=float(os.getenv("DB_POOL_MAX_LIFETIME_SECONDS", "900")),
             max_idle=float(os.getenv("DB_POOL_MAX_IDLE_SECONDS", "120")),
             kwargs={
                 "row_factory": dict_row,
-                "connect_timeout": 5,
-                "options": (
-                    f"-c statement_timeout={timeout_ms} "
-                    f"-c idle_in_transaction_session_timeout={idle_ms} "
-                    "-c application_name=gocomet_api"
-                ),
+                "connect_timeout": 10,
             },
+            configure=_configure_postgres_connection,
             open=False,
         )
-        _pool.open(wait=True, timeout=10)
+        _pool.open(wait=True, timeout=15)
     return _pool
 
 
@@ -400,6 +407,24 @@ def seed_mock_users(db: sqlite3.Connection) -> None:
         ),
     )
     for email, display_name, role, supplier_name, carrier_name, password in demo_users:
+        if using_postgres():
+            db.execute(
+                """INSERT INTO users (
+                    email, display_name, role, supplier_name, carrier_name,
+                    password_hash, is_active, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT (email) DO NOTHING""",
+                (
+                    email,
+                    display_name,
+                    role,
+                    supplier_name,
+                    carrier_name,
+                    hash_password(password),
+                    now,
+                ),
+            )
+            continue
         exists = db.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone()
         if exists:
             continue
@@ -422,6 +447,10 @@ def seed_mock_users(db: sqlite3.Connection) -> None:
 
 def seed_demo_data(db: sqlite3.Connection) -> None:
     """Populate a new database with a useful, time-relative demo portfolio."""
+    if using_postgres():
+        # Multiple serverless cold starts can initialize together. Serialize the
+        # empty check and inserts within their surrounding transaction.
+        db.execute("SELECT pg_advisory_xact_lock(hashtext('gocomet_demo_seed'))")
     if db.execute("SELECT 1 FROM rfqs LIMIT 1").fetchone():
         return
 

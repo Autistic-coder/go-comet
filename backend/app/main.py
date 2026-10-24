@@ -332,8 +332,12 @@ def _allowed_hosts() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    migrate_database()
-    init_db()
+    try:
+        migrate_database()
+        init_db()
+    except Exception:
+        logging.getLogger("gocomet.startup").exception("Application startup failed")
+        raise
     try:
         yield
     finally:
