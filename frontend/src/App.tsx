@@ -7,6 +7,7 @@ const currency = new Intl.NumberFormat("en-IN", {
   currency: "INR",
   maximumFractionDigits: 0,
 });
+const moneyNumber = (value: string | number) => Number(value);
 
 const statusLabels: Record<AuctionStatus, string> = {
   scheduled: "Scheduled",
@@ -177,8 +178,8 @@ function BidModal({ auction, user, onClose, onSubmitted }: { auction: AuctionDet
     const data = new FormData(event.currentTarget);
     try {
       const result = await api.submitBid(auction.id, {
-        freight_charges: Number(data.get("freight_charges")), origin_charges: Number(data.get("origin_charges")),
-        destination_charges: Number(data.get("destination_charges")), transit_time_days: Number(data.get("transit_time_days")),
+        freight_charges: String(data.get("freight_charges")), origin_charges: String(data.get("origin_charges")),
+        destination_charges: String(data.get("destination_charges")), transit_time_days: Number(data.get("transit_time_days")),
         validity_date: new Date(String(data.get("validity_date"))).toISOString(),
       });
       onSubmitted(result);
@@ -212,14 +213,14 @@ function AuctionDetails({ auction, user, now, onBack, onBid, onTransition }: { a
     </section>
     <div className="progress-track"><div style={{ width: `${progress}%` }} /><span className="trigger-marker">Trigger window</span></div>
     <section className="stat-row">
-      <article><span>Current L1</span><strong>{auction.lowest_bid == null ? "No bids" : currency.format(auction.lowest_bid)}</strong><small>{auction.bid_count} submitted bids</small></article>
+      <article><span>Current L1</span><strong>{auction.lowest_bid == null ? "No bids" : currency.format(moneyNumber(auction.lowest_bid))}</strong><small>{auction.bid_count} submitted bids</small></article>
       <article><span>Closes at</span><strong>{fmtDate(auction.current_close_at)}</strong><small>Original: {fmtDate(auction.original_close_at)}</small></article>
       <article><span>Forced close</span><strong>{fmtDate(auction.forced_close_at)}</strong><small>Hard stop, no exceptions</small></article>
       <article><span>Extension rule</span><strong>+{auction.extension_minutes} min</strong><small>Last {auction.trigger_window_minutes} min · {triggerLabels[auction.extension_trigger]}</small></article>
     </section>
     <div className="details-grid">
       <section className="panel"><header className="panel-header"><div><span className="eyebrow">Live standings</span><h2>Supplier rankings</h2></div><span className="panel-count">{auction.bids.length} bids</span></header>
-        {auction.bids.length === 0 ? <div className="empty-small"><span>↗</span><h3>No bids yet</h3><p>The first qualified quote will take the L1 position.</p></div> : <div className="bid-table-wrap"><table className="bid-table"><thead><tr><th>Rank</th><th>Supplier / carrier</th><th>Price</th><th>Transit</th><th>Validity</th></tr></thead><tbody>{auction.bids.map((bid) => <tr key={bid.id} className={`${bid.rank === 1 ? "winner" : ""} ${bid.is_own ? "own-bid" : ""}`}><td><span className={`rank rank-${bid.rank}`}>L{bid.rank}</span></td><td><strong>{bid.supplier_name}</strong><small>{bid.carrier_name}</small></td><td><strong>{currency.format(bid.total_price)}</strong><small>F {currency.format(bid.freight_charges)} · O {currency.format(bid.origin_charges)} · D {currency.format(bid.destination_charges)}</small></td><td>{bid.transit_time_days} days</td><td>{fmtDate(bid.validity_date)}</td></tr>)}</tbody></table></div>}
+        {auction.bids.length === 0 ? <div className="empty-small"><span>↗</span><h3>No bids yet</h3><p>The first qualified quote will take the L1 position.</p></div> : <div className="bid-table-wrap"><table className="bid-table"><thead><tr><th>Rank</th><th>Supplier / carrier</th><th>Price</th><th>Transit</th><th>Validity</th></tr></thead><tbody>{auction.bids.map((bid) => <tr key={bid.id} className={`${bid.rank === 1 ? "winner" : ""} ${bid.is_own ? "own-bid" : ""}`}><td><span className={`rank rank-${bid.rank}`}>L{bid.rank}</span></td><td><strong>{bid.supplier_name}</strong><small>{bid.carrier_name}</small></td><td><strong>{currency.format(moneyNumber(bid.total_price))}</strong><small>F {currency.format(moneyNumber(bid.freight_charges))} · O {currency.format(moneyNumber(bid.origin_charges))} · D {currency.format(moneyNumber(bid.destination_charges))}</small></td><td>{bid.transit_time_days} days</td><td>{fmtDate(bid.validity_date)}</td></tr>)}</tbody></table></div>}
       </section>
       <aside className="panel activity"><header className="panel-header"><div><span className="eyebrow">Audit trail</span><h2>Activity</h2></div></header><div className="timeline">{auction.events.map((event) => <article key={event.id}><span className={`timeline-dot ${event.event_type}`} /><div><p>{event.message}</p><time>{fmtDate(event.created_at)}</time></div></article>)}</div></aside>
     </div>
@@ -258,7 +259,7 @@ export default function App() {
 
   const visible = useMemo(() => auctions.filter((auction) => `${auction.name} ${auction.reference_id}`.toLowerCase().includes(query.toLowerCase())), [auctions, query]);
   const liveCount = auctions.filter((auction) => auction.status === "active").length;
-  const totalSavings = auctions.reduce((sum, auction) => sum + (auction.lowest_bid ? Math.max(0, 150000 - auction.lowest_bid) : 0), 0);
+  const totalSavings = auctions.reduce((sum, auction) => sum + (auction.lowest_bid ? Math.max(0, 150000 - moneyNumber(auction.lowest_bid)) : 0), 0);
 
   async function openAuction(id: number) { try { setSelected(await api.getAuction(id)); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not load RFQ"); } }
   function handleUpdated(detail: AuctionDetail) { setSelected(detail); setBidOpen(false); void load(); }
@@ -290,7 +291,7 @@ export default function App() {
         <section className="metrics"><article className="metric-primary"><div><span>Live auctions</span><strong>{liveCount}</strong><small>competitive events running now</small></div><div className="pulse-orbit"><i /><b /></div></article><article><span>Supplier quotes</span><strong>{auctions.reduce((sum, auction) => sum + auction.bid_count, 0)}</strong><small>offers across active lanes</small></article><article><span>Estimated savings</span><strong>{currency.format(totalSavings)}</strong><small className="positive">↗ created through competition</small></article></section>
         <section className="auction-section"><header className="section-title"><div><span className="eyebrow">Auction portfolio</span><h2>Current events</h2></div><span>{visible.length.toString().padStart(2, "0")} records</span></header><div className="list-controls"><div className="tabs">{["all", "active", "scheduled", "closed", "force_closed"].map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{value === "all" ? "All auctions" : statusLabels[value as AuctionStatus]}</button>)}</div><div className="search"><span>⌕</span><input aria-label="Search auctions" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search RFQ or lane" /></div></div>
           {error && <div className="error-banner"><span>!</span><div><strong>Could not reach the auction API</strong><p>{error}. Start the FastAPI server on port 8000, then retry.</p></div><button onClick={() => void load()}>Retry</button></div>}
-          {loading ? <div className="loading-list">Loading auctions…</div> : visible.length === 0 ? <div className="empty-state"><div className="empty-icon"><span>↗</span></div><span className="eyebrow">Ready for competition</span><h2>No auctions here yet</h2><p>Create a British auction to collect transparent bids, rank suppliers automatically, and prevent last-second sniping.</p><button className="button primary" onClick={() => setCreateOpen(true)}>Create your first auction</button></div> : <div className="auction-list">{visible.map((auction) => <article className="auction-card" key={auction.id} onClick={() => void openAuction(auction.id)}><div className="auction-main"><StatusPill status={auction.status} /><div><span className="rfq-ref">{auction.reference_id}</span><h3>{auction.name}</h3><p>{auction.bid_count} bids · Forced close {fmtDate(auction.forced_close_at)}</p></div></div><div className="auction-stat"><span>Current L1</span><strong>{auction.lowest_bid == null ? "—" : currency.format(auction.lowest_bid)}</strong></div><div className="auction-stat countdown"><span>{auction.status === "active" ? "Time remaining" : "Current close"}</span><strong>{auction.status === "active" ? countdown(auction.current_close_at, now) : fmtDate(auction.current_close_at)}</strong></div><button className="row-arrow" aria-label={`Open ${auction.name}`}>→</button></article>)}</div>}
+          {loading ? <div className="loading-list">Loading auctions…</div> : visible.length === 0 ? <div className="empty-state"><div className="empty-icon"><span>↗</span></div><span className="eyebrow">Ready for competition</span><h2>No auctions here yet</h2><p>Create a British auction to collect transparent bids, rank suppliers automatically, and prevent last-second sniping.</p><button className="button primary" onClick={() => setCreateOpen(true)}>Create your first auction</button></div> : <div className="auction-list">{visible.map((auction) => <article className="auction-card" key={auction.id} onClick={() => void openAuction(auction.id)}><div className="auction-main"><StatusPill status={auction.status} /><div><span className="rfq-ref">{auction.reference_id}</span><h3>{auction.name}</h3><p>{auction.bid_count} bids · Forced close {fmtDate(auction.forced_close_at)}</p></div></div><div className="auction-stat"><span>Current L1</span><strong>{auction.lowest_bid == null ? "—" : currency.format(moneyNumber(auction.lowest_bid))}</strong></div><div className="auction-stat countdown"><span>{auction.status === "active" ? "Time remaining" : "Current close"}</span><strong>{auction.status === "active" ? countdown(auction.current_close_at, now) : fmtDate(auction.current_close_at)}</strong></div><button className="row-arrow" aria-label={`Open ${auction.name}`}>→</button></article>)}</div>}
         </section>
       </main>}
     </div>

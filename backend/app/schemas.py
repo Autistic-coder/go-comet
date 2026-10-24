@@ -114,12 +114,12 @@ class BidResponse(BaseModel):
     id: int
     supplier_name: str
     carrier_name: str
-    freight_charges: float
-    origin_charges: float
-    destination_charges: float
+    freight_charges: Decimal
+    origin_charges: Decimal
+    destination_charges: Decimal
     transit_time_days: int
     validity_date: datetime
-    total_price: float
+    total_price: Decimal
     submitted_at: datetime
     rank: int
     is_own: bool
@@ -133,7 +133,7 @@ class RfqSummary(BaseModel):
     current_close_at: datetime
     forced_close_at: datetime
     status: str
-    lowest_bid: float | None
+    lowest_bid: Decimal | None
     bid_count: int
     lifecycle_state: str
     version: int

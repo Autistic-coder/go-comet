@@ -1,5 +1,18 @@
 # Architecture
 
+## Backend boundaries
+
+- `app/api/routes` contains transport-only routers and operational endpoints.
+- `app/domain` contains deterministic money, status, and extension rules without I/O.
+- `app/services` coordinates transactional work and notification delivery.
+- `app/repositories` requires tenant scope at the persistence boundary.
+- `app/database.py` owns SQLite compatibility, bounded PostgreSQL pooling, and timeouts.
+- `alembic/versions` owns ordered production schema changes.
+
+Each write transaction contains the auction mutation, domain event, idempotency/audit state, and notification-outbox row. Delivery happens afterward and retries without repeating the auction mutation. PostgreSQL row locks serialize bids per auction; advisory locks serialize each idempotency key and schema migration.
+
+Observability has JSON request logs with request IDs, Prometheus RED/business metrics at `/metrics`, and optional OTLP traces.
+
 ## System context
 
 ```mermaid

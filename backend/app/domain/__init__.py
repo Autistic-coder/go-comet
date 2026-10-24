@@ -1,0 +1,1 @@
+"""Pure auction domain rules."""

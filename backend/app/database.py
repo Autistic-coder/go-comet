@@ -4,16 +4,19 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Iterator
 
 import psycopg
+from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
 
 from .security import hash_password
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "rfq.db"
+_pool: ConnectionPool | None = None
 
 
 def _stamp(value: datetime) -> str:
@@ -49,26 +52,70 @@ class PostgresConnection:
     def rollback(self):
         self.raw.rollback()
 
-    def close(self):
-        self.raw.close()
+
+def postgres_pool() -> ConnectionPool:
+    """Return a lazy, bounded pool suitable for serverless Fluid Compute reuse."""
+    global _pool
+    if _pool is None:
+        max_size = max(1, int(os.getenv("DB_POOL_MAX_SIZE", "5")))
+        timeout_ms = max(100, int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "5000")))
+        idle_ms = max(timeout_ms, int(os.getenv("DB_IDLE_TX_TIMEOUT_MS", "10000")))
+        _pool = ConnectionPool(
+            conninfo=os.environ["DATABASE_URL"],
+            min_size=0,
+            max_size=max_size,
+            timeout=float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "5")),
+            max_lifetime=float(os.getenv("DB_POOL_MAX_LIFETIME_SECONDS", "900")),
+            max_idle=float(os.getenv("DB_POOL_MAX_IDLE_SECONDS", "120")),
+            kwargs={
+                "row_factory": dict_row,
+                "connect_timeout": 5,
+                "options": (
+                    f"-c statement_timeout={timeout_ms} "
+                    f"-c idle_in_transaction_session_timeout={idle_ms} "
+                    "-c application_name=gocomet_api"
+                ),
+            },
+            open=False,
+        )
+        _pool.open(wait=True, timeout=10)
+    return _pool
+
+
+def close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
+def migrate_database() -> None:
+    """Apply checked-in Alembic revisions; SQLite retains its lightweight demo bootstrap."""
+    if not using_postgres():
+        return
+    from alembic import command
+    from alembic.config import Config
+
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    command.upgrade(config, "head")
 
 
 @contextmanager
 def connection() -> Iterator[sqlite3.Connection | PostgresConnection]:
     if using_postgres():
-        raw = psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row, connect_timeout=10)
-        db = PostgresConnection(raw)
-        try:
-            yield db
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+        with postgres_pool().connection() as raw:
+            db = PostgresConnection(raw)
+            try:
+                yield db
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
         return
     path = get_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.register_adapter(Decimal, lambda value: format(value, "f"))
     db = sqlite3.connect(path, check_same_thread=False, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
@@ -88,7 +135,6 @@ def connection() -> Iterator[sqlite3.Connection | PostgresConnection]:
 def init_db() -> None:
     with connection() as db:
         if using_postgres():
-            _init_postgres(db)
             seed_mock_users(db)
             retention_cutoff = _stamp(datetime.now(timezone.utc) - timedelta(hours=24))
             db.execute("DELETE FROM idempotency_records WHERE created_at < ?", (retention_cutoff,))
@@ -185,6 +231,26 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_idempotency_created
             ON idempotency_records(created_at);
+
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                aggregate_type TEXT NOT NULL,
+                aggregate_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','processing','delivered','failed')),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at TEXT NOT NULL,
+                locked_at TEXT,
+                delivered_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(tenant_id, aggregate_type, aggregate_id, event_type, created_at)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_outbox_delivery
+            ON notification_outbox(status, available_at, id);
             """
         )
         _migrate_legacy_schema(db)

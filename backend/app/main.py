@@ -20,6 +20,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 
 from .auth import (
@@ -33,7 +34,12 @@ from .auth import (
     require_role,
     set_auth_cookies,
 )
-from .database import connection, init_db, using_postgres
+from .api.routes.system import router as system_router
+from .database import close_pool, connection, init_db, migrate_database, using_postgres
+from .domain.auction import extension_close, money, status_for, total_price
+from .observability import BIDS, EXTENSIONS, HTTP_DURATION, HTTP_REQUESTS, configure_telemetry
+from .repositories.auctions import AuctionRepository
+from .services.outbox import enqueue as enqueue_outbox
 from .schemas import (
     AuctionAction, AuctionStatus, AuctionTransition, BidCreate, LoginRequest,
     RfqCreate, RfqDetail, RfqSummary,
@@ -51,6 +57,10 @@ DUMMY_PASSWORD_HASH = (  # nosec B105
     "pbkdf2_sha256$180000$00112233445566778899aabbccddeeff$"
     "974edb851e78b8b609e8c279354cbbd9e2bc633dcf68acfc31561ec2df39392d"
 )
+
+
+def json_payload(value: object) -> object:
+    return jsonable_encoder(value, custom_encoder={Decimal: lambda amount: format(amount, ".2f")})
 
 
 def utc_now() -> datetime:
@@ -75,18 +85,7 @@ def parse(value: str) -> datetime:
 
 
 def auction_status(rfq: sqlite3.Row, now: datetime) -> str:
-    lifecycle = rfq["lifecycle_state"] if "lifecycle_state" in rfq.keys() else "published"
-    if lifecycle in {"paused", "cancelled", "awarded"}:
-        return lifecycle
-    forced_close = parse(rfq["forced_close_at"])
-    current_close = parse(rfq["current_close_at"])
-    if now >= forced_close and current_close >= forced_close:
-        return "force_closed"
-    if now >= current_close:
-        return "closed"
-    if now < parse(rfq["bid_start_at"]):
-        return "scheduled"
-    return "active"
+    return status_for(rfq, now, parse)
 
 
 def ranked_bids(db: sqlite3.Connection, rfq_id: int) -> list[dict]:
@@ -99,12 +98,12 @@ def ranked_bids(db: sqlite3.Connection, rfq_id: int) -> list[dict]:
             "id": row["id"],
             "supplier_name": row["supplier_name"],
             "carrier_name": row["carrier_name"],
-            "freight_charges": float(row["freight_charges"]),
-            "origin_charges": float(row["origin_charges"]),
-            "destination_charges": float(row["destination_charges"]),
+            "freight_charges": money(row["freight_charges"]),
+            "origin_charges": money(row["origin_charges"]),
+            "destination_charges": money(row["destination_charges"]),
             "transit_time_days": row["transit_time_days"],
             "validity_date": row["validity_date"],
-            "total_price": float(row["total_price"]),
+            "total_price": money(row["total_price"]),
             "submitted_at": row["submitted_at"],
             "bidder_user_id": row["bidder_user_id"],
             "rank": rank,
@@ -139,7 +138,7 @@ def serialize_summary(db: sqlite3.Connection, rfq: sqlite3.Row, now: datetime) -
         "current_close_at": rfq["current_close_at"],
         "forced_close_at": rfq["forced_close_at"],
         "status": auction_status(rfq, now),
-        "lowest_bid": float(aggregate["lowest_bid"]) if aggregate["lowest_bid"] is not None else None,
+        "lowest_bid": money(aggregate["lowest_bid"]) if aggregate["lowest_bid"] is not None else None,
         "bid_count": aggregate["bid_count"],
         "lifecycle_state": rfq["lifecycle_state"],
         "version": rfq["version"],
@@ -206,7 +205,7 @@ def _visible_events(db: sqlite3.Connection, rfq_id: int, viewer: UserContext) ->
         if viewer.role == "bidder" and row["event_type"] == "bid_submitted":
             metadata = json.loads(row["metadata_json"] or "{}")
             message = (
-                f"You submitted a bid of {metadata.get('total', 0):,.2f}"
+                f"You submitted a bid of {money(metadata.get('total', 0)):,.2f}"
                 if metadata.get("bidder_user_id") == viewer.id
                 else "A supplier submitted a bid"
             )
@@ -311,7 +310,7 @@ def _store_idempotency(
             key,
             request_hash,
             response_status,
-            json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+            json.dumps(json_payload(payload), separators=(",", ":"), ensure_ascii=False),
             iso(utc_now()),
         ),
     )
@@ -333,8 +332,12 @@ def _allowed_hosts() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    migrate_database()
     init_db()
-    yield
+    try:
+        yield
+    finally:
+        close_pool()
 
 
 app = FastAPI(
@@ -343,6 +346,8 @@ app = FastAPI(
     description="Role-aware RFQ bidding with idempotent writes and hard forced-close rules.",
     lifespan=lifespan,
 )
+configure_telemetry(app)
+app.include_router(system_router)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts())
 app.add_middleware(
     CORSMiddleware,
@@ -386,6 +391,10 @@ async def security_middleware(request: Request, call_next):
     started = utc_now()
     response = await call_next(request)
     duration_ms = round((utc_now() - started).total_seconds() * 1000, 2)
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", request.url.path)
+    HTTP_REQUESTS.labels(request.method, route_path, str(response.status_code)).inc()
+    HTTP_DURATION.labels(request.method, route_path).observe(duration_ms / 1000)
     logger.info(json.dumps({"event": "http_request", "request_id": request_id,
         "method": request.method, "path": request.url.path,
         "status": response.status_code, "duration_ms": duration_ms}, separators=(",", ":")))
@@ -416,14 +425,6 @@ async def database_error_handler(_: Request, __: sqlite3.OperationalError) -> JS
         content={"detail": "The auction service is temporarily unavailable"},
         headers={"Retry-After": "2"},
     )
-
-
-@app.get("/api/health")
-def health() -> dict:
-    with connection() as db:
-        db.execute("SELECT 1").fetchone()
-    return {"status": "ok", "service": "gocomet-auctions", "version": "3.0.0",
-            "database": "postgresql" if using_postgres() else "sqlite-demo"}
 
 
 @app.post("/api/auth/login")
@@ -548,10 +549,13 @@ def create_rfq(
         )
         rfq = db.execute("SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?", (rfq_id, user.tenant_id)).fetchone()
         result = serialize_detail(db, rfq, now, user)
+        enqueue_outbox(db, tenant_id=user.tenant_id, aggregate_id=rfq_id,
+            event_type="auction_created", payload={"event_type": "auction_created", "rfq_id": rfq_id},
+            created_at=iso(now))
         _store_idempotency(db, user.id, operation, key, request_hash, 201, result)
         return JSONResponse(
             status_code=status.HTTP_201_CREATED,
-            content=result,
+            content=json_payload(result),
             headers={"Idempotency-Replayed": "false"},
         )
 
@@ -566,10 +570,7 @@ def list_rfqs(
 ) -> list[dict]:
     moment = as_utc(now) if now else utc_now()
     with connection() as db:
-        rows = db.execute(
-            "SELECT * FROM rfqs WHERE tenant_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            (user.tenant_id, limit, offset),
-        ).fetchall()
+        rows = AuctionRepository(db, user.tenant_id).list(limit, offset)
         items = [serialize_summary(db, row, moment) for row in rows]
         if status_filter:
             items = [item for item in items if item["status"] == status_filter.value]
@@ -585,7 +586,7 @@ def get_rfq(
 ) -> dict:
     moment = as_utc(now) if now else utc_now()
     with connection() as db:
-        rfq = db.execute("SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?", (rfq_id, user.tenant_id)).fetchone()
+        rfq = AuctionRepository(db, user.tenant_id).get(rfq_id)
         if not rfq:
             raise HTTPException(status_code=404, detail="RFQ not found")
         response.headers["ETag"] = f'"{rfq["version"]}"'
@@ -612,10 +613,7 @@ def transition_rfq(
         replay = _replay_or_conflict(db, user.id, operation, key, request_hash)
         if replay:
             return replay
-        lock_sql = "SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?"
-        if using_postgres():
-            lock_sql += " FOR UPDATE"
-        rfq = db.execute(lock_sql, (rfq_id, user.tenant_id)).fetchone()
+        rfq = AuctionRepository(db, user.tenant_id).get(rfq_id, for_update=using_postgres())
         if not rfq:
             raise HTTPException(status_code=404, detail="RFQ not found")
         if if_match is not None and if_match.strip('"') != str(rfq["version"]):
@@ -663,8 +661,12 @@ def transition_rfq(
             details={"reason": payload.reason, "bid_id": payload.bid_id})
         updated = db.execute("SELECT * FROM rfqs WHERE id = ?", (rfq_id,)).fetchone()
         result = serialize_detail(db, updated, now, user)
+        enqueue_outbox(db, tenant_id=user.tenant_id, aggregate_id=rfq_id,
+            event_type=f"auction_{payload.action.value}",
+            payload={"event_type": f"auction_{payload.action.value}", "rfq_id": rfq_id, "bid_id": payload.bid_id},
+            created_at=iso(now))
         _store_idempotency(db, user.id, operation, key, request_hash, 200, result)
-        return JSONResponse(content=result, headers={"Idempotency-Replayed": "false"})
+        return JSONResponse(content=json_payload(result), headers={"Idempotency-Replayed": "false"})
 
 
 @app.get("/api/rfqs/{rfq_id}/events/stream")
@@ -694,7 +696,7 @@ async def stream_rfq_events(
                     item = dict(row)
                     metadata = json.loads(item.pop("metadata_json") or "{}")
                     if user.role == "bidder" and item["event_type"] == "bid_submitted":
-                        item["message"] = (f"You submitted a bid of {metadata.get('total', 0):,.2f}"
+                        item["message"] = (f"You submitted a bid of {money(metadata.get('total', 0)):,.2f}"
                             if metadata.get("bidder_user_id") == user.id else "A supplier submitted a bid")
                     data = json.dumps(item, separators=(",", ":"))
                     yield f"id: {last_id}\nevent: auction\ndata: {data}\n\n"
@@ -737,10 +739,7 @@ def submit_bid(
     request_hash = _payload_hash(payload)
     operation = f"submit_bid:{rfq_id}"
     submitted_at = utc_now()
-    total_decimal = (
-        payload.freight_charges + payload.origin_charges + payload.destination_charges
-    ).quantize(Decimal("0.01"))
-    total = float(total_decimal)
+    total = total_price(payload.freight_charges, payload.origin_charges, payload.destination_charges)
 
     if not user.supplier_name or not user.carrier_name:
         raise HTTPException(status_code=409, detail="Bidder profile is incomplete")
@@ -751,10 +750,7 @@ def submit_bid(
         replay = _replay_or_conflict(db, user.id, operation, key, request_hash)
         if replay:
             return replay
-        lock_sql = "SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?"
-        if using_postgres():
-            lock_sql += " FOR UPDATE"
-        rfq = db.execute(lock_sql, (rfq_id, user.tenant_id)).fetchone()
+        rfq = AuctionRepository(db, user.tenant_id).get(rfq_id, for_update=using_postgres())
         if not rfq:
             raise HTTPException(status_code=404, detail="RFQ not found")
         if auction_status(rfq, submitted_at) != "active":
@@ -764,7 +760,6 @@ def submit_bid(
 
         previous = ranked_bids(db, rfq_id)
         previous_order = [bid["bidder_user_id"] or bid["supplier_name"] for bid in previous]
-        previous_l1 = previous_order[0] if previous_order else None
 
         db.execute(
             """INSERT INTO bids (
@@ -776,9 +771,9 @@ def submit_bid(
                 rfq_id,
                 user.supplier_name,
                 user.carrier_name,
-                float(payload.freight_charges),
-                float(payload.origin_charges),
-                float(payload.destination_charges),
+                money(payload.freight_charges),
+                money(payload.origin_charges),
+                money(payload.destination_charges),
                 payload.transit_time_days,
                 iso(payload.validity_date),
                 total,
@@ -798,7 +793,7 @@ def submit_bid(
                     {
                         "bidder_user_id": user.id,
                         "supplier": user.supplier_name,
-                        "total": total,
+                        "total": format(total, "f"),
                     }
                 ),
                 iso(submitted_at),
@@ -807,54 +802,54 @@ def submit_bid(
 
         current = ranked_bids(db, rfq_id)
         current_order = [bid["bidder_user_id"] or bid["supplier_name"] for bid in current]
-        current_l1 = current_order[0] if current_order else None
-        in_window = submitted_at >= parse(rfq["current_close_at"]) - timedelta(
-            minutes=rfq["trigger_window_minutes"]
-        )
         trigger = rfq["extension_trigger"]
-        should_extend = in_window and (
-            trigger == "bid_received"
-            or (trigger == "any_rank_change" and previous_order != current_order)
-            or (trigger == "lowest_bidder_change" and previous_l1 != current_l1)
+        old_close = parse(rfq["current_close_at"])
+        new_close = extension_close(
+            submitted_at=submitted_at, current_close=old_close,
+            forced_close=parse(rfq["forced_close_at"]), window_minutes=rfq["trigger_window_minutes"],
+            extension_minutes=rfq["extension_minutes"], trigger=trigger,
+            previous_order=previous_order, current_order=current_order,
         )
 
-        if should_extend:
-            old_close = parse(rfq["current_close_at"])
-            forced_close = parse(rfq["forced_close_at"])
-            new_close = min(old_close + timedelta(minutes=rfq["extension_minutes"]), forced_close)
-            if new_close > old_close:
-                reason = {
-                    "bid_received": "bid received inside the trigger window",
-                    "any_rank_change": "supplier ranking changed inside the trigger window",
-                    "lowest_bidder_change": "the lowest bidder changed inside the trigger window",
-                }[trigger]
-                db.execute("UPDATE rfqs SET current_close_at = ?, version = version + 1 WHERE id = ?", (iso(new_close), rfq_id))
-                db.execute(
-                    """INSERT INTO auction_events (
-                        rfq_id, event_type, message, metadata_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        rfq_id,
-                        "auction_extended",
-                        f"Auction extended to {new_close.isoformat()} because {reason}",
-                        json.dumps(
-                            {
-                                "old_close": iso(old_close),
-                                "new_close": iso(new_close),
-                                "reason": reason,
-                                "actor_user_id": user.id,
-                            }
-                        ),
-                        iso(submitted_at),
+        if new_close:
+            reason = {
+                "bid_received": "bid received inside the trigger window",
+                "any_rank_change": "supplier ranking changed inside the trigger window",
+                "lowest_bidder_change": "the lowest bidder changed inside the trigger window",
+            }[trigger]
+            db.execute("UPDATE rfqs SET current_close_at = ?, version = version + 1 WHERE id = ?", (iso(new_close), rfq_id))
+            EXTENSIONS.labels(trigger).inc()
+            db.execute(
+                """INSERT INTO auction_events (
+                    rfq_id, event_type, message, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    rfq_id,
+                    "auction_extended",
+                    f"Auction extended to {new_close.isoformat()} because {reason}",
+                    json.dumps(
+                        {
+                            "old_close": iso(old_close),
+                            "new_close": iso(new_close),
+                            "reason": reason,
+                            "actor_user_id": user.id,
+                        }
                     ),
-                )
+                    iso(submitted_at),
+                ),
+            )
 
         updated = db.execute("SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?", (rfq_id, user.tenant_id)).fetchone()
         result = serialize_detail(db, updated, submitted_at, user)
+        BIDS.inc()
+        enqueue_outbox(db, tenant_id=user.tenant_id, aggregate_id=rfq_id,
+            event_type="bid_submitted",
+            payload={"event_type": "bid_submitted", "rfq_id": rfq_id, "bidder_user_id": user.id},
+            created_at=iso(submitted_at))
         _store_idempotency(db, user.id, operation, key, request_hash, 201, result)
         return JSONResponse(
             status_code=status.HTTP_201_CREATED,
-            content=result,
+            content=json_payload(result),
             headers={"Idempotency-Replayed": "false"},
         )
 

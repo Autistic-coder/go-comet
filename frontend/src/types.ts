@@ -2,6 +2,7 @@ export type AuctionStatus = "scheduled" | "active" | "closed" | "force_closed" |
 export type AuctionAction = "pause" | "resume" | "cancel" | "award";
 export type ExtensionTrigger = "bid_received" | "any_rank_change" | "lowest_bidder_change";
 export type UserRole = "buyer" | "bidder";
+export type Money = string;
 
 export interface SessionUser {
   id: number;
@@ -21,7 +22,7 @@ export interface AuctionSummary {
   current_close_at: string;
   forced_close_at: string;
   status: AuctionStatus;
-  lowest_bid: number | null;
+  lowest_bid: Money | null;
   bid_count: number;
   lifecycle_state: string;
   version: number;
@@ -31,12 +32,12 @@ export interface Bid {
   id: number;
   supplier_name: string;
   carrier_name: string;
-  freight_charges: number;
-  origin_charges: number;
-  destination_charges: number;
+  freight_charges: Money;
+  origin_charges: Money;
+  destination_charges: Money;
   transit_time_days: number;
   validity_date: string;
-  total_price: number;
+  total_price: Money;
   submitted_at: string;
   rank: number;
   is_own: boolean;

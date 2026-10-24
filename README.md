@@ -30,9 +30,12 @@ These credentials are intentionally public. The mock login exercises server-side
 - HttpOnly sessions, CSRF validation, login throttling, and secure response headers
 - Tenant-scoped authorization and data access
 - Pause, resume, cancel, and award lifecycle controls with optimistic locking
-- PostgreSQL production mode with row-level auction locks
+- Alembic-managed PostgreSQL schema with row locks and a bounded connection pool
+- Exact `Decimal`/`NUMERIC(18,2)` money handling without binary-float arithmetic
+- Transactional notification outbox with retry/backoff and skip-locked workers
 - Real-time server-sent auction events
-- Security audit ledger, structured request logs, and server timing
+- Security audit ledger, Prometheus metrics, optional OpenTelemetry, and structured logs
+- PostgreSQL race tests, cross-tenant adversarial tests, and a k6 CI performance gate
 
 The interface uses the visual language of the MindMesh AI/ML workspace: warm paper surfaces, charcoal navigation, lime highlights, editorial serif headings, and compact data-focused labels.
 
@@ -56,7 +59,7 @@ Set `SEED_DEMO_DATA=true` to insert the sample records into an empty database. E
 | Frontend | React 19, TypeScript, Vite, responsive CSS |
 | Backend | FastAPI, Pydantic |
 | Database | PostgreSQL production mode; SQLite demo fallback |
-| Testing | 22 Pytest API, security, auction, and lifecycle checks |
+| Testing | 25 SQLite checks, PostgreSQL race tests, and k6 load thresholds |
 | Production | Multi-stage Docker container |
 | Hosting | Vercel and Render configuration included |
 
@@ -66,16 +69,20 @@ Set `SEED_DEMO_DATA=true` to insert the sample records into an empty database. E
 flowchart LR
     U[Buyer / Bidder] -->|HTTPS| R[React]
     R -->|Session + CSRF + Idempotency-Key| A[FastAPI]
-    A --> G[Auth and role guard]
-    G --> E[Auction engine]
-    E --> D[(PostgreSQL / SQLite demo)]
+    A --> G[API routers and auth guards]
+    G --> E[Application services]
+    E --> X[Pure auction domain]
+    E --> P[Tenant-scoped repositories]
+    P --> D[(Pooled PostgreSQL / SQLite demo)]
     E --> L[Audit events]
+    E --> O[Transactional outbox]
+    O --> W[Retrying worker / webhook]
     A --> I[Idempotency ledger]
     I --> D
     L --> D
 ```
 
-FastAPI owns identity, tenant authorization, auction state, totals, ranking, extension decisions, and privacy filtering. PostgreSQL production writes lock the target RFQ row with `SELECT ... FOR UPDATE`; SQLite demo writes use `BEGIN IMMEDIATE`. The bid, extension, audit records, and idempotency response commit together.
+FastAPI owns identity, tenant authorization, auction state, exact monetary totals, ranking, extension decisions, and privacy filtering. PostgreSQL writes lock the target RFQ row with `SELECT ... FOR UPDATE`; SQLite demo writes use `BEGIN IMMEDIATE`. Auction data, audit/idempotency state, and its notification intent commit together. Alembic serializes startup migrations with a PostgreSQL advisory lock.
 
 Read the full [architecture document](docs/architecture.md).
 
@@ -89,9 +96,10 @@ erDiagram
     USERS ||--o{ IDEMPOTENCY_RECORDS : scopes
     RFQS ||--o{ BIDS : receives
     RFQS ||--o{ AUCTION_EVENTS : records
+    RFQS ||--o{ NOTIFICATION_OUTBOX : publishes
 ```
 
-The schema includes users, hashed sessions, RFQs, immutable bids, audit events, and stored idempotency responses. See the complete [schema and constraint reference](docs/schema.md).
+The schema includes users, hashed sessions, RFQs, immutable exact-money bids, audit events, stored idempotency responses, and a transactional outbox. See the complete [schema and constraint reference](docs/schema.md).
 
 ## Design and security
 
@@ -147,6 +155,13 @@ For a separately hosted backend, provide its origin through `VITE_API_URL`.
 | `CORS_ALLOWED_ORIGINS` | Local Vite origins | Comma-separated browser origins |
 | `PASSWORD_HASH_ITERATIONS` | `180000` | PBKDF2 work factor; lower values are used only in tests |
 | `VITE_API_URL` | Same origin | Optional external backend origin used by the frontend |
+| `DB_POOL_MAX_SIZE` | `5` | Maximum PostgreSQL connections per application instance |
+| `DB_POOL_TIMEOUT_SECONDS` | `5` | Maximum wait for a pooled connection |
+| `DB_STATEMENT_TIMEOUT_MS` | `5000` | Server-side SQL statement timeout |
+| `DB_IDLE_TX_TIMEOUT_MS` | `10000` | Server-side idle transaction timeout |
+| `OUTBOX_WORKER_TOKEN` | unset | Bearer secret for the private outbox worker endpoint |
+| `NOTIFICATION_WEBHOOK_URL` | log sink | Optional HTTPS notification delivery target |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enables batched OpenTelemetry trace export |
 
 ## Auction rules
 
@@ -236,12 +251,13 @@ render.yaml           Render Blueprint
 cd backend
 python -m pytest -q
 python -m compileall -q app
+python -m alembic upgrade head
 
 cd ..\frontend
 npm run build
 ```
 
-The backend runs 22 checks covering bid ranking, forced-close enforcement, password storage, authentication, authorization, CSRF, throttling, sessions, idempotency, privacy, validation, security headers, demonstration seeding, lifecycle transitions, optimistic locking, award integrity, and audit creation. CI additionally compiles Python, checks dependency consistency, audits Python and npm dependencies, runs Bandit, builds React, and builds both deployment containers.
+The backend runs 25 local checks covering bid ranking, exact money, atomic outbox writes, forced-close enforcement, authentication, authorization, cross-tenant attacks, CSRF, throttling, sessions, idempotency, privacy, validation, security headers, lifecycle transitions, optimistic locking, award integrity, metrics, and audit creation. CI additionally boots PostgreSQL 16 and races identical bid requests, runs [k6 thresholds](docs/benchmarks.md), audits dependencies, runs Bandit, builds React, and builds both production containers.
 
 ## Production-readiness boundary
 

@@ -22,6 +22,48 @@ jobs:
       - run: python -m compileall -q app
       - run: PYTHONPATH=. pytest -q
 
+  postgres-concurrency:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gocomet
+          POSTGRES_PASSWORD: gocomet_test
+          POSTGRES_DB: gocomet_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gocomet -d gocomet_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      DATABASE_URL: postgresql://gocomet:gocomet_test@localhost:5432/gocomet_test
+      TEST_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m alembic upgrade head
+      - run: PYTHONPATH=. pytest -q tests/test_postgres_concurrency.py
+
+  load-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r backend/requirements.txt
+      - name: Start API
+        run: PYTHONPATH=backend SEED_DEMO_DATA=false AUTH_COOKIE_SECURE=false PASSWORD_HASH_ITERATIONS=1000 uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+      - uses: grafana/setup-k6-action@v1
+      - run: k6 run load/k6-auction.js
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

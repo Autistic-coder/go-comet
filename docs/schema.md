@@ -1,5 +1,11 @@
 # Database Schema
 
+The production schema is owned by Alembic rather than request-time ad hoc DDL. Run `python -m alembic upgrade head` from `backend/`. Startup also applies revisions under a PostgreSQL advisory lock so parallel instances cannot race migrations.
+
+Money columns use `NUMERIC(18,2)` in PostgreSQL and map to Python `Decimal`; totals are quantized before persistence.
+
+`notification_outbox` stores tenant, aggregate, event type, JSON payload, delivery state, attempt count, retry time, lock time, error, and delivery time. It is inserted in the auction transaction. Workers claim due rows with `FOR UPDATE SKIP LOCKED`, use bounded exponential backoff, and require a separate bearer secret.
+
 ```mermaid
 erDiagram
     USERS ||--o{ SESSIONS : owns
@@ -9,6 +15,7 @@ erDiagram
     USERS ||--o{ SECURITY_AUDIT_LOG : acts
     RFQS ||--o{ BIDS : receives
     RFQS ||--o{ AUCTION_EVENTS : records
+    RFQS ||--o{ NOTIFICATION_OUTBOX : publishes
 
     USERS {
       integer id PK
