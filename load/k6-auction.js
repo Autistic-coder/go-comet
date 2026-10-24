@@ -20,11 +20,12 @@ function login(email, password) {
     headers: { 'Content-Type': 'application/json' },
   });
   check(response, { 'login succeeds': (r) => r.status === 200 });
-  return http.cookieJar().cookiesForURL(BASE).gocomet_csrf[0];
+  const cookies = http.cookieJar().cookiesForURL(BASE);
+  return { csrf: cookies.gocomet_csrf[0], session: cookies.gocomet_session[0] };
 }
 
 export function setup() {
-  const csrf = login('buyer.demo@example.com', 'BuyerDemo!2026');
+  const buyer = login('buyer.demo@example.com', 'BuyerDemo!2026');
   const now = new Date();
   const payload = {
     reference_id: `LOAD-${Date.now()}`,
@@ -38,26 +39,27 @@ export function setup() {
     extension_trigger: 'bid_received',
   };
   const response = http.post(`${BASE}/api/rfqs`, JSON.stringify(payload), { headers: {
-    'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'Idempotency-Key': `load-create-${Date.now()}`,
+    'Content-Type': 'application/json', 'X-CSRF-Token': buyer.csrf, 'Idempotency-Key': `load-create-${Date.now()}`,
   }});
   check(response, { 'load RFQ created': (r) => r.status === 201 });
-  return { rfqId: response.json('id'), validity: new Date(now.getTime() + 86400000).toISOString() };
+  const bidder = login('bidder.demo@example.com', 'BidderDemo!2026');
+  return { rfqId: response.json('id'), validity: new Date(now.getTime() + 86400000).toISOString(), buyer, bidder };
 }
 
-export function readPath() {
-  const csrf = login('buyer.demo@example.com', 'BuyerDemo!2026');
-  const response = http.get(`${BASE}/api/rfqs`);
+export function readPath(data) {
+  const response = http.get(`${BASE}/api/rfqs`, { headers: {
+    Cookie: `gocomet_session=${data.buyer.session}; gocomet_csrf=${data.buyer.csrf}`,
+  }});
   check(response, { 'auction list succeeds': (r) => r.status === 200 });
-  void csrf;
 }
 
 export function bidRace(data) {
-  const csrf = login('bidder.demo@example.com', 'BidderDemo!2026');
   const response = http.post(`${BASE}/api/rfqs/${data.rfqId}/bids`, JSON.stringify({
     freight_charges: '1000.10', origin_charges: '20.20', destination_charges: '30.30',
     transit_time_days: 2, validity_date: data.validity,
   }), { headers: {
-    'Content-Type': 'application/json', 'X-CSRF-Token': csrf, 'Idempotency-Key': 'load-race-bid-0001',
+    'Content-Type': 'application/json', 'X-CSRF-Token': data.bidder.csrf, 'Idempotency-Key': 'load-race-bid-0001',
+    Cookie: `gocomet_session=${data.bidder.session}; gocomet_csrf=${data.bidder.csrf}`,
   }});
   check(response, { 'racing retry is accepted or replayed': (r) => r.status === 201 });
 }

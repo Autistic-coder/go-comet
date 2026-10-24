@@ -61,6 +61,8 @@ jobs:
       - run: pip install -r backend/requirements.txt
       - name: Start API
         run: PYTHONPATH=backend SEED_DEMO_DATA=false AUTH_COOKIE_SECURE=false PASSWORD_HASH_ITERATIONS=1000 uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+      - name: Wait for API
+        run: for i in {1..30}; do curl --fail http://127.0.0.1:8000/api/health && exit 0; sleep 1; done; exit 1
       - uses: grafana/setup-k6-action@v1
       - run: k6 run load/k6-auction.js
 
