@@ -1,50 +1,88 @@
-# High-Level Design
+# Architecture
 
-## Architecture
+## System context
 
 ```mermaid
 flowchart LR
-    U[Buyer / Supplier] -->|HTTPS| R[React Web App]
-    R -->|JSON REST API| F[FastAPI Service]
-    F --> V[Request validation\nPydantic]
-    F --> E[Auction engine\nranking + extension rules]
-    E --> D[(SQLite / relational DB)]
-    D --> E
-    E --> L[Activity log]
+    B[Buyer browser] -->|HTTPS + session cookie| R[React application]
+    S[Bidder browser] -->|HTTPS + session cookie| R
+    R -->|JSON REST + CSRF + idempotency key| A[FastAPI service]
+    A --> M[Security middleware]
+    M --> AU[Authentication and RBAC]
+    AU --> E[Auction engine]
+    E --> D[(SQLite relational store)]
+    E --> L[Append-only activity log]
+    A --> I[Idempotency ledger]
+    I --> D
     L --> D
 ```
 
-The React client is a procurement control tower for creating and monitoring auctions, reviewing live rankings, submitting test supplier quotes, and reading the audit trail. FastAPI is the source of truth for auction status, validation, ranking, and extension behavior. SQLite keeps the assignment runnable with no external services; the schema is portable to PostgreSQL for production.
+The React and FastAPI applications are built into one container and served from one origin. That keeps cookies first-party and removes the need to expose session credentials to browser JavaScript. FastAPI is the source of truth for identity, role authorization, auction status, bid totals, ranking, and extension decisions.
 
-## Request flow: bid submission
+## Trust boundaries
+
+1. The browser is untrusted. Supplier names, roles, timestamps, totals, and auction state are never accepted as authoritative.
+2. A random session token is stored only in an HttpOnly, SameSite=Strict cookie. Only its SHA-256 digest is stored in the database.
+3. State-changing requests must also supply the matching CSRF token and a valid idempotency key.
+4. Buyer-only and bidder-only operations are enforced in FastAPI, not only hidden in React.
+5. SQLite transactions use `BEGIN IMMEDIATE` around write decisions so a bid, extension, audit entry, and idempotency record commit together.
+
+## Login and authorization flow
 
 ```mermaid
 sequenceDiagram
-    participant S as Supplier UI
-    participant A as FastAPI
-    participant D as Database
-    S->>A: POST /api/rfqs/{id}/bids
-    A->>D: Load RFQ and current ranking
-    A->>A: Validate active interval and quote
-    A->>D: Save bid and bid event
-    A->>D: Recompute ranking
-    A->>A: Evaluate trigger inside X-minute window
-    alt trigger matches
-        A->>A: min(close + Y, forced close)
-        A->>D: Update close and save extension event
-    end
-    A-->>S: Updated auction, bids, rankings, events
+    participant UI as React UI
+    participant API as FastAPI
+    participant DB as SQLite
+    UI->>API: POST /api/auth/login
+    API->>API: Rate limit by IP + email
+    API->>DB: Load active user
+    API->>API: Verify PBKDF2 password hash
+    API->>DB: Store hashed session + CSRF digest
+    API-->>UI: HttpOnly session cookie + CSRF cookie + role
+    UI->>API: Authenticated request
+    API->>DB: Resolve session and expiry
+    API->>API: Enforce buyer or bidder role
+    API-->>UI: Role-appropriate response
 ```
 
-## Key design decisions
+## Idempotent bid flow
 
-- The server accepts an optional `submitted_at` in the assignment implementation so extension rules can be tested deterministically. A production API should derive it exclusively from server time.
-- `current_close_at` is stored independently from `original_close_at` to make every extension explicit and auditable.
-- Status is derived from timestamps instead of persisted, preventing stale status values.
-- Bid totals are calculated on the server from freight, origin, and destination charges.
-- Each bid is immutable; a supplier improvement is a new bid, preserving price history.
+```mermaid
+sequenceDiagram
+    participant UI as Bidder UI
+    participant API as FastAPI
+    participant DB as SQLite
+    UI->>API: POST bid + CSRF + Idempotency-Key
+    API->>DB: BEGIN IMMEDIATE
+    API->>DB: Find key for user + operation
+    alt same key and same request hash
+        DB-->>API: Stored response
+        API-->>UI: Replay response, Idempotency-Replayed=true
+    else same key and different hash
+        API-->>UI: 409 Conflict
+    else new key
+        API->>DB: Load RFQ and current ranking
+        API->>API: Validate active interval and quote
+        API->>DB: Insert immutable bid and audit event
+        API->>API: Recalculate ranking and extension trigger
+        opt trigger matches
+            API->>DB: Update close time, capped at forced close
+            API->>DB: Insert extension event
+        end
+        API->>DB: Store response in idempotency ledger
+        API->>DB: COMMIT
+        API-->>UI: 201 with updated auction
+    end
+```
 
-## Production hardening
+## Deployment
 
-Use PostgreSQL transactions with row-level locking around bid placement, authenticated buyer/supplier roles, tenant isolation, idempotency keys, currency fields stored as integer minor units, background notifications, and WebSockets or server-sent events for instant live updates.
+- `Dockerfile.vercel` produces the Vercel container deployment.
+- `Dockerfile` and `render.yaml` support Render.
+- React build assets are served by FastAPI after all API routes.
+- SQLite is intentionally zero-setup for this demonstration. Production persistence should use PostgreSQL with row-level locks and shared rate-limit storage.
 
+## Observability
+
+Every response includes `X-Request-ID`. Auction mutations create immutable business events containing actor identifiers in metadata. Operational database failures return a generic 503 with `Retry-After`; internal exception details are not sent to clients.

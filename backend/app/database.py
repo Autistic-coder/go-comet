@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
+from .security import hash_password
+
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "rfq.db"
 
@@ -25,9 +27,14 @@ def get_db_path() -> Path:
 
 @contextmanager
 def connection() -> Iterator[sqlite3.Connection]:
-    db = sqlite3.connect(get_db_path(), check_same_thread=False)
+    path = get_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, check_same_thread=False, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys = ON")
+    db.execute("PRAGMA busy_timeout = 10000")
+    db.execute("PRAGMA journal_mode = WAL")
+    db.execute("PRAGMA synchronous = NORMAL")
     try:
         yield db
         db.commit()
@@ -42,6 +49,31 @@ def init_db() -> None:
     with connection() as db:
         db.executescript(
             """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                display_name TEXT NOT NULL CHECK (length(trim(display_name)) BETWEEN 2 AND 100),
+                role TEXT NOT NULL CHECK (role IN ('buyer', 'bidder')),
+                supplier_name TEXT,
+                carrier_name TEXT,
+                password_hash TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                csrf_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_token_expiry
+            ON sessions(token_hash, expires_at);
+
             CREATE TABLE IF NOT EXISTS rfqs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 reference_id TEXT NOT NULL UNIQUE,
@@ -56,6 +88,7 @@ def init_db() -> None:
                 extension_trigger TEXT NOT NULL CHECK (
                     extension_trigger IN ('bid_received', 'any_rank_change', 'lowest_bidder_change')
                 ),
+                created_by_user_id INTEGER REFERENCES users(id),
                 created_at TEXT NOT NULL
             );
 
@@ -70,6 +103,7 @@ def init_db() -> None:
                 transit_time_days INTEGER NOT NULL CHECK (transit_time_days > 0),
                 validity_date TEXT NOT NULL,
                 total_price REAL NOT NULL CHECK (total_price >= 0),
+                bidder_user_id INTEGER REFERENCES users(id),
                 submitted_at TEXT NOT NULL
             );
 
@@ -87,10 +121,83 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_events_rfq_created
             ON auction_events(rfq_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS idempotency_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                operation TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response_status INTEGER NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, operation, idempotency_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_idempotency_created
+            ON idempotency_records(created_at);
             """
         )
+        _migrate_legacy_schema(db)
+        seed_mock_users(db)
+        retention_cutoff = _stamp(datetime.now(timezone.utc) - timedelta(hours=24))
+        db.execute("DELETE FROM idempotency_records WHERE created_at < ?", (retention_cutoff,))
+        db.execute("DELETE FROM sessions WHERE expires_at <= ?", (_stamp(datetime.now(timezone.utc)),))
         if _demo_data_enabled():
             seed_demo_data(db)
+
+
+def _column_names(db: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_legacy_schema(db: sqlite3.Connection) -> None:
+    if "created_by_user_id" not in _column_names(db, "rfqs"):
+        db.execute("ALTER TABLE rfqs ADD COLUMN created_by_user_id INTEGER REFERENCES users(id)")
+    if "bidder_user_id" not in _column_names(db, "bids"):
+        db.execute("ALTER TABLE bids ADD COLUMN bidder_user_id INTEGER REFERENCES users(id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_bids_bidder ON bids(bidder_user_id, submitted_at DESC)")
+
+
+def seed_mock_users(db: sqlite3.Connection) -> None:
+    now = _stamp(datetime.now(timezone.utc))
+    demo_users = (
+        (
+            "buyer.demo@example.com",
+            "Aarav Mehta",
+            "buyer",
+            None,
+            None,
+            "BuyerDemo!2026",
+        ),
+        (
+            "bidder.demo@example.com",
+            "Neha Sharma",
+            "bidder",
+            "Northstar Logistics",
+            "Northstar Roadways",
+            "BidderDemo!2026",
+        ),
+    )
+    for email, display_name, role, supplier_name, carrier_name, password in demo_users:
+        exists = db.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone()
+        if exists:
+            continue
+        db.execute(
+            """INSERT INTO users (
+                email, display_name, role, supplier_name, carrier_name,
+                password_hash, is_active, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+            (
+                email,
+                display_name,
+                role,
+                supplier_name,
+                carrier_name,
+                hash_password(password),
+                now,
+            ),
+        )
 
 
 def seed_demo_data(db: sqlite3.Connection) -> None:

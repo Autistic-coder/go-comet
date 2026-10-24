@@ -4,6 +4,15 @@ A full-stack freight procurement workspace for running transparent British aucti
 
 **Live application:** [go-comet-xi.vercel.app](https://go-comet-xi.vercel.app)
 
+## Demo login
+
+| Role | Email | Password | Access |
+| --- | --- | --- | --- |
+| Buyer | `buyer.demo@example.com` | `BuyerDemo!2026` | Create auctions, see full rankings, review audits |
+| Bidder | `bidder.demo@example.com` | `BidderDemo!2026` | View opportunities and submit bids as Northstar Logistics |
+
+These credentials are intentionally public. The mock login exercises server-side sessions, CSRF protection, privacy masking, and role authorization, but it must be replaced with a real identity provider before production use.
+
 ## Product highlights
 
 - Live, scheduled, closed, and force-closed auction views
@@ -16,6 +25,9 @@ A full-stack freight procurement workspace for running transparent British aucti
 - Search and status filters
 - Responsive desktop and mobile interface
 - Seeded demonstration auctions visible immediately after deployment
+- Buyer and bidder role separation
+- Idempotent RFQ creation and bid submission
+- HttpOnly sessions, CSRF validation, login throttling, and secure response headers
 
 The interface uses the visual language of the MindMesh AI/ML workspace: warm paper surfaces, charcoal navigation, lime highlights, editorial serif headings, and compact data-focused labels.
 
@@ -42,6 +54,52 @@ Set `SEED_DEMO_DATA=true` to insert the sample records into an empty database. E
 | Testing | Pytest, FastAPI TestClient |
 | Production | Multi-stage Docker container |
 | Hosting | Vercel and Render configuration included |
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[Buyer / Bidder] -->|HTTPS| R[React]
+    R -->|Session + CSRF + Idempotency-Key| A[FastAPI]
+    A --> G[Auth and role guard]
+    G --> E[Auction engine]
+    E --> D[(SQLite)]
+    E --> L[Audit events]
+    A --> I[Idempotency ledger]
+    I --> D
+    L --> D
+```
+
+FastAPI owns identity, authorization, auction status, totals, ranking, extension decisions, and privacy filtering. Writes use a SQLite `BEGIN IMMEDIATE` transaction so the bid, extension, audit records, and idempotency response commit together.
+
+Read the full [architecture document](docs/architecture.md).
+
+## Schema
+
+```mermaid
+erDiagram
+    USERS ||--o{ SESSIONS : owns
+    USERS ||--o{ RFQS : creates
+    USERS ||--o{ BIDS : submits
+    USERS ||--o{ IDEMPOTENCY_RECORDS : scopes
+    RFQS ||--o{ BIDS : receives
+    RFQS ||--o{ AUCTION_EVENTS : records
+```
+
+The schema includes users, hashed sessions, RFQs, immutable bids, audit events, and stored idempotency responses. See the complete [schema and constraint reference](docs/schema.md).
+
+## Design and security
+
+The [security and application design document](docs/design.md) describes:
+
+- Buyer and bidder authorization
+- Mock session creation and revocation
+- CSRF double-submit validation
+- Idempotency replay and conflict behavior
+- Auction transaction boundaries
+- Supplier privacy and audit redaction
+- Input, request-size, CORS, trusted-host, and response-header controls
+- Production limitations and recommended upgrades
 
 ## Run locally
 
@@ -78,6 +136,10 @@ For a separately hosted backend, provide its origin through `VITE_API_URL`.
 | --- | --- | --- |
 | `RFQ_DATABASE_PATH` | `backend/rfq.db` | Location of the SQLite database |
 | `SEED_DEMO_DATA` | `false` | Adds demonstration auctions when the database is empty |
+| `AUTH_COOKIE_SECURE` | `false` locally | Sends authentication cookies only over HTTPS when enabled |
+| `ALLOWED_HOSTS` | Localhost plus deployment hosts | Comma-separated trusted Host values |
+| `CORS_ALLOWED_ORIGINS` | Local Vite origins | Comma-separated browser origins |
+| `PASSWORD_HASH_ITERATIONS` | `180000` | PBKDF2 work factor; lower values are used only in tests |
 | `VITE_API_URL` | Same origin | Optional external backend origin used by the frontend |
 
 ## Auction rules
@@ -101,10 +163,13 @@ The API rejects bids outside the active interval. Every bid submission and aucti
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/health` | Service health check |
+| `POST` | `/api/auth/login` | Start a role-aware mock session |
+| `GET` | `/api/auth/session` | Resolve the current session |
+| `POST` | `/api/auth/logout` | Revoke the current session |
 | `GET` | `/api/rfqs` | List and filter auctions |
-| `POST` | `/api/rfqs` | Create an auction |
+| `POST` | `/api/rfqs` | Create an auction; buyer + CSRF + idempotency required |
 | `GET` | `/api/rfqs/{id}` | Get auction details, bids, and events |
-| `POST` | `/api/rfqs/{id}/bids` | Submit a supplier bid |
+| `POST` | `/api/rfqs/{id}/bids` | Submit a bid; bidder + CSRF + idempotency required |
 
 The generated OpenAPI reference is available at `/docs` whenever the backend is running.
 
@@ -132,10 +197,13 @@ The free Blueprint uses ephemeral SQLite storage. For persistent data, attach a 
 backend/
   app/
     database.py       SQLite setup and demonstration records
-    main.py           FastAPI routes and auction rules
+    auth.py           Sessions, CSRF, roles, and login throttling
+    main.py           FastAPI routes, middleware, and auction rules
     schemas.py        Request and response models
+    security.py       Password and token cryptography
   tests/
-    test_auction.py   Auction, extension, and seed tests
+    test_auction.py   Auction, extension, privacy, and seed tests
+    test_security.py  Auth, CSRF, RBAC, idempotency, and validation tests
 frontend/
   src/
     App.tsx           Auction dashboard and interaction flows
@@ -143,8 +211,9 @@ frontend/
     styles.css        Responsive visual system
     types.ts          Shared frontend types
 docs/
-  architecture.md     High-level architecture and data flow
-  schema.md           Database schema and rationale
+  architecture.md     Trust boundaries and request flows
+  schema.md           Complete schema, constraints, and indexes
+  design.md           Security decisions and production limitations
 Dockerfile            Render-compatible production image
 Dockerfile.vercel     Vercel container image
 render.yaml           Render Blueprint
@@ -161,4 +230,4 @@ cd ..\frontend
 npm run build
 ```
 
-The backend test suite covers bid ranking, trigger behavior, forced-close enforcement, and demonstration-data seeding.
+The backend currently runs 19 checks covering bid ranking, forced-close enforcement, password storage, authentication, authorization, CSRF, login rate limits, session logout and expiry, required idempotency keys, idempotent replay, idempotency conflicts, supplier privacy, strict payload validation, pagination bounds, trusted hosts, security headers, request IDs, request-size limits, and demonstration-data seeding.

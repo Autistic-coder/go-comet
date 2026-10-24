@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
-import type { AuctionDetail, AuctionStatus, AuctionSummary, ExtensionTrigger } from "./types";
+import type { AuctionDetail, AuctionStatus, AuctionSummary, ExtensionTrigger, SessionUser } from "./types";
 
 const currency = new Intl.NumberFormat("en-IN", {
   style: "currency",
@@ -46,6 +46,65 @@ function nowLocalInput(offsetMinutes: number) {
 
 function StatusPill({ status }: { status: AuctionStatus }) {
   return <span className={`status-pill status-${status}`}><i />{statusLabels[status]}</span>;
+}
+
+const demoAccounts = {
+  buyer: { email: "buyer.demo@example.com", password: "BuyerDemo!2026", label: "Buyer workspace" },
+  bidder: { email: "bidder.demo@example.com", password: "BidderDemo!2026", label: "Bidder portal" },
+};
+
+function LoginScreen({ onLogin }: { onLogin: (user: SessionUser) => void }) {
+  const [email, setEmail] = useState(demoAccounts.buyer.email);
+  const [password, setPassword] = useState(demoAccounts.buyer.password);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  function choose(role: keyof typeof demoAccounts) {
+    setEmail(demoAccounts[role].email);
+    setPassword(demoAccounts[role].password);
+    setError("");
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      const result = await api.login(email, password);
+      onLogin(result.user);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Sign in failed");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return <main className="login-page">
+    <section className="login-intro">
+      <div className="brand login-brand"><span className="brand-mark">G</span><strong>GoComet</strong></div>
+      <span className="eyebrow">Secure procurement workspace</span>
+      <h1>One auction.<br/><em>Two clear roles.</em></h1>
+      <p>Use a demonstration identity to explore the buyer control tower or submit a protected supplier bid.</p>
+      <div className="login-security"><span>01</span> Role-based access <span>02</span> Idempotent writes <span>03</span> Audited actions</div>
+    </section>
+    <section className="login-panel">
+      <div><span className="eyebrow">Mock access</span><h2>Choose your desk</h2><p>These accounts are for demonstration only.</p></div>
+      <div className="account-picker">
+        {(Object.entries(demoAccounts) as [keyof typeof demoAccounts, typeof demoAccounts.buyer][]).map(([role, account]) =>
+          <button type="button" key={role} className={email === account.email ? "selected" : ""} onClick={() => choose(role)}>
+            <span>{role === "buyer" ? "B" : "S"}</span><strong>{account.label}</strong><small>{role === "buyer" ? "Create and monitor auctions" : "Place protected carrier bids"}</small>
+          </button>
+        )}
+      </div>
+      <form className="login-form" onSubmit={submit}>
+        <label><span>Email</span><input required type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+        <label><span>Password</span><input required type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+        {error && <p className="form-error">{error}</p>}
+        <button className="button primary" disabled={saving}>{saving ? "Signing in…" : "Enter workspace →"}</button>
+      </form>
+      <p className="demo-note">Mock authentication uses server-side sessions and role checks, but the published credentials are intentionally public and must not be used for real users.</p>
+    </section>
+  </main>;
 }
 
 function CreateAuctionModal({ onClose, onCreated }: { onClose: () => void; onCreated: (auction: AuctionDetail) => void }) {
@@ -104,7 +163,7 @@ function CreateAuctionModal({ onClose, onCreated }: { onClose: () => void; onCre
   );
 }
 
-function BidModal({ auction, onClose, onSubmitted }: { auction: AuctionDetail; onClose: () => void; onSubmitted: (auction: AuctionDetail) => void }) {
+function BidModal({ auction, user, onClose, onSubmitted }: { auction: AuctionDetail; user: SessionUser; onClose: () => void; onSubmitted: (auction: AuctionDetail) => void }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -115,7 +174,6 @@ function BidModal({ auction, onClose, onSubmitted }: { auction: AuctionDetail; o
     const data = new FormData(event.currentTarget);
     try {
       const result = await api.submitBid(auction.id, {
-        supplier_name: data.get("supplier_name"), carrier_name: data.get("carrier_name"),
         freight_charges: Number(data.get("freight_charges")), origin_charges: Number(data.get("origin_charges")),
         destination_charges: Number(data.get("destination_charges")), transit_time_days: Number(data.get("transit_time_days")),
         validity_date: new Date(String(data.get("validity_date"))).toISOString(),
@@ -129,8 +187,7 @@ function BidModal({ auction, onClose, onSubmitted }: { auction: AuctionDetail; o
   return <div className="modal-backdrop" onMouseDown={onClose}><section className="modal compact" onMouseDown={(event) => event.stopPropagation()} aria-modal="true" role="dialog">
     <header className="modal-header"><div><span className="eyebrow">{auction.reference_id}</span><h2>Submit supplier bid</h2></div><button className="icon-button" onClick={onClose} aria-label="Close">×</button></header>
     <form className="form-grid" onSubmit={submit}>
-      <label><span>Supplier</span><input required name="supplier_name" placeholder="Northstar Logistics" /></label>
-      <label><span>Carrier</span><input required name="carrier_name" placeholder="Northstar Roadways" /></label>
+      <div className="bidder-identity wide"><span>Authenticated bidder</span><strong>{user.supplier_name}</strong><small>{user.carrier_name}</small></div>
       <label><span>Freight charges</span><input required name="freight_charges" type="number" min="0" step="0.01" /></label>
       <label><span>Origin charges</span><input required name="origin_charges" type="number" min="0" step="0.01" defaultValue="0" /></label>
       <label><span>Destination charges</span><input required name="destination_charges" type="number" min="0" step="0.01" defaultValue="0" /></label>
@@ -142,13 +199,13 @@ function BidModal({ auction, onClose, onSubmitted }: { auction: AuctionDetail; o
   </section></div>;
 }
 
-function AuctionDetails({ auction, now, onBack, onBid }: { auction: AuctionDetail; now: number; onBack: () => void; onBid: () => void }) {
+function AuctionDetails({ auction, user, now, onBack, onBid }: { auction: AuctionDetail; user: SessionUser; now: number; onBack: () => void; onBid: () => void }) {
   const progress = Math.min(100, Math.max(0, ((now - new Date(auction.bid_start_at).getTime()) / (new Date(auction.current_close_at).getTime() - new Date(auction.bid_start_at).getTime())) * 100));
   return <main className="content details-view">
     <button className="back-button" onClick={onBack}>← Back to auctions</button>
     <section className="details-hero">
       <div><div className="detail-title-row"><StatusPill status={auction.status} /><span className="rfq-ref">{auction.reference_id}</span></div><h1>{auction.name}</h1><p>Pickup / service · {fmtDate(auction.pickup_service_at)}</p></div>
-      <div className="hero-actions"><div className="big-countdown"><span>Time remaining</span><strong>{countdown(auction.current_close_at, now)}</strong></div>{auction.status === "active" && <button className="button primary" onClick={onBid}>+ Submit bid</button>}</div>
+      <div className="hero-actions"><div className="big-countdown"><span>Time remaining</span><strong>{countdown(auction.current_close_at, now)}</strong></div>{auction.status === "active" && user.role === "bidder" && <button className="button primary" onClick={onBid}>+ Submit bid</button>}</div>
     </section>
     <div className="progress-track"><div style={{ width: `${progress}%` }} /><span className="trigger-marker">Trigger window</span></div>
     <section className="stat-row">
@@ -159,7 +216,7 @@ function AuctionDetails({ auction, now, onBack, onBid }: { auction: AuctionDetai
     </section>
     <div className="details-grid">
       <section className="panel"><header className="panel-header"><div><span className="eyebrow">Live standings</span><h2>Supplier rankings</h2></div><span className="panel-count">{auction.bids.length} bids</span></header>
-        {auction.bids.length === 0 ? <div className="empty-small"><span>↗</span><h3>No bids yet</h3><p>The first qualified quote will take the L1 position.</p></div> : <div className="bid-table-wrap"><table className="bid-table"><thead><tr><th>Rank</th><th>Supplier / carrier</th><th>Price</th><th>Transit</th><th>Validity</th></tr></thead><tbody>{auction.bids.map((bid) => <tr key={bid.id} className={bid.rank === 1 ? "winner" : ""}><td><span className={`rank rank-${bid.rank}`}>L{bid.rank}</span></td><td><strong>{bid.supplier_name}</strong><small>{bid.carrier_name}</small></td><td><strong>{currency.format(bid.total_price)}</strong><small>F {currency.format(bid.freight_charges)} · O {currency.format(bid.origin_charges)} · D {currency.format(bid.destination_charges)}</small></td><td>{bid.transit_time_days} days</td><td>{fmtDate(bid.validity_date)}</td></tr>)}</tbody></table></div>}
+        {auction.bids.length === 0 ? <div className="empty-small"><span>↗</span><h3>No bids yet</h3><p>The first qualified quote will take the L1 position.</p></div> : <div className="bid-table-wrap"><table className="bid-table"><thead><tr><th>Rank</th><th>Supplier / carrier</th><th>Price</th><th>Transit</th><th>Validity</th></tr></thead><tbody>{auction.bids.map((bid) => <tr key={bid.id} className={`${bid.rank === 1 ? "winner" : ""} ${bid.is_own ? "own-bid" : ""}`}><td><span className={`rank rank-${bid.rank}`}>L{bid.rank}</span></td><td><strong>{bid.supplier_name}</strong><small>{bid.carrier_name}</small></td><td><strong>{currency.format(bid.total_price)}</strong><small>F {currency.format(bid.freight_charges)} · O {currency.format(bid.origin_charges)} · D {currency.format(bid.destination_charges)}</small></td><td>{bid.transit_time_days} days</td><td>{fmtDate(bid.validity_date)}</td></tr>)}</tbody></table></div>}
       </section>
       <aside className="panel activity"><header className="panel-header"><div><span className="eyebrow">Audit trail</span><h2>Activity</h2></div></header><div className="timeline">{auction.events.map((event) => <article key={event.id}><span className={`timeline-dot ${event.event_type}`} /><div><p>{event.message}</p><time>{fmtDate(event.created_at)}</time></div></article>)}</div></aside>
     </div>
@@ -167,6 +224,8 @@ function AuctionDetails({ auction, now, onBack, onBid }: { auction: AuctionDetai
 }
 
 export default function App() {
+  const [user, setUser] = useState<SessionUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [auctions, setAuctions] = useState<AuctionSummary[]>([]);
   const [selected, setSelected] = useState<AuctionDetail | null>(null);
   const [filter, setFilter] = useState("all");
@@ -178,11 +237,15 @@ export default function App() {
   const [now, setNow] = useState(Date.now());
 
   const load = useCallback(async () => {
+    if (!user) return;
     try { setAuctions(await api.listAuctions(filter)); setError(""); }
     catch (reason) { setError(reason instanceof Error ? reason.message : "API unavailable"); }
     finally { setLoading(false); }
-  }, [filter]);
+  }, [filter, user]);
 
+  useEffect(() => {
+    api.session().then((result) => setUser(result.user)).catch(() => setUser(null)).finally(() => setAuthLoading(false));
+  }, []);
   useEffect(() => { void load(); }, [load]);
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
 
@@ -193,12 +256,23 @@ export default function App() {
   async function openAuction(id: number) { try { setSelected(await api.getAuction(id)); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not load RFQ"); } }
   function handleUpdated(detail: AuctionDetail) { setSelected(detail); setBidOpen(false); void load(); }
 
+  async function logout() {
+    try { await api.logout(); } finally {
+      setUser(null);
+      setSelected(null);
+      setAuctions([]);
+    }
+  }
+
+  if (authLoading) return <div className="auth-loading"><span className="brand-mark">G</span><p>Securing workspace…</p></div>;
+  if (!user) return <LoginScreen onLogin={setUser} />;
+
   return <div className="app-shell">
-    <aside className="sidebar"><div className="brand"><span className="brand-mark">G</span><strong>GoComet</strong></div><p className="brand-caption">Freight intelligence</p><nav aria-label="Main navigation"><button type="button" className="active" aria-current="page"><span>01</span>Auctions</button><button type="button"><span>02</span>RFQs</button><button type="button"><span>03</span>Suppliers</button><button type="button"><span>04</span>Analytics</button></nav><div className="sidebar-bottom"><button type="button"><span>05</span>Settings</button><div className="profile"><div className="avatar">VB</div><div><strong>Vaibhav Bedi</strong><span>Procurement admin</span></div></div></div></aside>
+    <aside className="sidebar"><div className="brand"><span className="brand-mark">G</span><strong>GoComet</strong></div><p className="brand-caption">Freight intelligence</p><nav aria-label="Main navigation"><button type="button" className="active" aria-current="page"><span>01</span>Auctions</button><button type="button"><span>02</span>RFQs</button><button type="button"><span>03</span>Suppliers</button><button type="button"><span>04</span>Analytics</button></nav><div className="sidebar-bottom"><button type="button" onClick={() => void logout()}><span>05</span>Sign out</button><div className="profile"><div className="avatar">{user.display_name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div><div><strong>{user.display_name}</strong><span>{user.role === "buyer" ? "Buyer administrator" : user.supplier_name}</span></div></div></div></aside>
     <div className="main-shell">
-      <header className="topbar"><div className="mobile-brand"><span className="brand-mark">G</span><strong>GoComet</strong></div><div className="topbar-title"><span>Workspace <b>/</b> Procurement</span><strong>Live auction desk</strong></div><div className="topbar-actions"><span className="system-state"><i /> Market online</span><button className="button primary" onClick={() => setCreateOpen(true)}>New auction <span aria-hidden="true">↗</span></button></div></header>
-      {selected ? <AuctionDetails auction={selected} now={now} onBack={() => setSelected(null)} onBid={() => setBidOpen(true)} /> : <main className="content">
-        <section className="page-heading"><div><span className="eyebrow">Freight procurement · live intelligence</span><h1>Better rates,<br/><em>decided in real time.</em></h1><p>Run transparent British auctions, compare qualified carriers, and turn every bid into measurable savings.</p></div><button className="button primary mobile-new" onClick={() => setCreateOpen(true)}>New auction <span aria-hidden="true">↗</span></button></section>
+      <header className="topbar"><div className="mobile-brand"><span className="brand-mark">G</span><strong>GoComet</strong></div><div className="topbar-title"><span>Workspace <b>/</b> {user.role === "buyer" ? "Procurement" : "Supplier portal"}</span><strong>Live auction desk</strong></div><div className="topbar-actions"><span className="role-badge">{user.role}</span><span className="system-state"><i /> Market online</span>{user.role === "buyer" && <button className="button primary" onClick={() => setCreateOpen(true)}>New auction <span aria-hidden="true">↗</span></button>}</div></header>
+      {selected ? <AuctionDetails auction={selected} user={user} now={now} onBack={() => setSelected(null)} onBid={() => setBidOpen(true)} /> : <main className="content">
+        <section className="page-heading"><div><span className="eyebrow">Freight procurement · live intelligence</span><h1>{user.role === "buyer" ? <>Better rates,<br/><em>decided in real time.</em></> : <>Qualified lanes,<br/><em>ready for your bid.</em></>}</h1><p>{user.role === "buyer" ? "Run transparent British auctions, compare qualified carriers, and turn every bid into measurable savings." : "Review open freight opportunities and submit quotes through your verified supplier identity."}</p></div>{user.role === "buyer" && <button className="button primary mobile-new" onClick={() => setCreateOpen(true)}>New auction <span aria-hidden="true">↗</span></button>}</section>
         <section className="metrics"><article className="metric-primary"><div><span>Live auctions</span><strong>{liveCount}</strong><small>competitive events running now</small></div><div className="pulse-orbit"><i /><b /></div></article><article><span>Supplier quotes</span><strong>{auctions.reduce((sum, auction) => sum + auction.bid_count, 0)}</strong><small>offers across active lanes</small></article><article><span>Estimated savings</span><strong>{currency.format(totalSavings)}</strong><small className="positive">↗ created through competition</small></article></section>
         <section className="auction-section"><header className="section-title"><div><span className="eyebrow">Auction portfolio</span><h2>Current events</h2></div><span>{visible.length.toString().padStart(2, "0")} records</span></header><div className="list-controls"><div className="tabs">{["all", "active", "scheduled", "closed", "force_closed"].map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{value === "all" ? "All auctions" : statusLabels[value as AuctionStatus]}</button>)}</div><div className="search"><span>⌕</span><input aria-label="Search auctions" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search RFQ or lane" /></div></div>
           {error && <div className="error-banner"><span>!</span><div><strong>Could not reach the auction API</strong><p>{error}. Start the FastAPI server on port 8000, then retry.</p></div><button onClick={() => void load()}>Retry</button></div>}
@@ -206,8 +280,8 @@ export default function App() {
         </section>
       </main>}
     </div>
-    {createOpen && <CreateAuctionModal onClose={() => setCreateOpen(false)} onCreated={(auction) => { setCreateOpen(false); setSelected(auction); void load(); }} />}
-    {bidOpen && selected && <BidModal auction={selected} onClose={() => setBidOpen(false)} onSubmitted={handleUpdated} />}
+    {createOpen && user.role === "buyer" && <CreateAuctionModal onClose={() => setCreateOpen(false)} onCreated={(auction) => { setCreateOpen(false); setSelected(auction); void load(); }} />}
+    {bidOpen && selected && user.role === "bidder" && <BidModal auction={selected} user={user} onClose={() => setBidOpen(false)} onSubmitted={handleUpdated} />}
   </div>;
 }
 

@@ -11,7 +11,8 @@ FROM python:3.11-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     RFQ_DATABASE_PATH=/tmp/rfq.db \
-    SEED_DEMO_DATA=true
+    SEED_DEMO_DATA=true \
+    AUTH_COOKIE_SECURE=true
 
 WORKDIR /app
 COPY backend/requirements.txt ./backend/requirements.txt

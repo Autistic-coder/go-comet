@@ -1,5 +1,15 @@
 export type AuctionStatus = "scheduled" | "active" | "closed" | "force_closed";
 export type ExtensionTrigger = "bid_received" | "any_rank_change" | "lowest_bidder_change";
+export type UserRole = "buyer" | "bidder";
+
+export interface SessionUser {
+  id: number;
+  email: string;
+  display_name: string;
+  role: UserRole;
+  supplier_name: string | null;
+  carrier_name: string | null;
+}
 
 export interface AuctionSummary {
   id: number;
@@ -25,6 +35,7 @@ export interface Bid {
   total_price: number;
   submitted_at: string;
   rank: number;
+  is_own: boolean;
 }
 
 export interface AuctionEvent {

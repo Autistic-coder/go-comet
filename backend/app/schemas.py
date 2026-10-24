@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
 class ExtensionTrigger(str, Enum):
@@ -12,8 +17,20 @@ class ExtensionTrigger(str, Enum):
     LOWEST_BIDDER_CHANGE = "lowest_bidder_change"
 
 
-class RfqCreate(BaseModel):
-    reference_id: str = Field(min_length=2, max_length=50)
+class AuctionStatus(str, Enum):
+    SCHEDULED = "scheduled"
+    ACTIVE = "active"
+    CLOSED = "closed"
+    FORCE_CLOSED = "force_closed"
+
+
+class LoginRequest(StrictModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+
+
+class RfqCreate(StrictModel):
+    reference_id: str = Field(min_length=2, max_length=50, pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
     name: str = Field(min_length=3, max_length=120)
     bid_start_at: datetime
     bid_close_at: datetime
@@ -23,8 +40,21 @@ class RfqCreate(BaseModel):
     extension_minutes: int = Field(ge=1, le=120)
     extension_trigger: ExtensionTrigger
 
+    @field_validator("reference_id")
+    @classmethod
+    def normalize_reference(cls, value: str) -> str:
+        return value.upper()
+
     @model_validator(mode="after")
     def validate_dates(self) -> "RfqCreate":
+        dates = (
+            self.bid_start_at,
+            self.bid_close_at,
+            self.forced_close_at,
+            self.pickup_service_at,
+        )
+        if any(value.tzinfo is None or value.utcoffset() is None for value in dates):
+            raise ValueError("All auction timestamps must include a timezone")
         if self.bid_close_at <= self.bid_start_at:
             raise ValueError("Bid close time must be later than bid start time")
         if self.forced_close_at <= self.bid_close_at:
@@ -34,15 +64,19 @@ class RfqCreate(BaseModel):
         return self
 
 
-class BidCreate(BaseModel):
-    supplier_name: str = Field(min_length=2, max_length=100)
-    carrier_name: str = Field(min_length=2, max_length=100)
-    freight_charges: float = Field(ge=0)
-    origin_charges: float = Field(ge=0)
-    destination_charges: float = Field(ge=0)
+class BidCreate(StrictModel):
+    freight_charges: Decimal = Field(ge=0, le=100_000_000, decimal_places=2)
+    origin_charges: Decimal = Field(ge=0, le=100_000_000, decimal_places=2)
+    destination_charges: Decimal = Field(ge=0, le=100_000_000, decimal_places=2)
     transit_time_days: int = Field(ge=1, le=365)
     validity_date: datetime
-    submitted_at: datetime | None = None
+
+    @field_validator("validity_date")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("Quote validity must include a timezone")
+        return value
 
 
 class EventResponse(BaseModel):
@@ -64,6 +98,7 @@ class BidResponse(BaseModel):
     total_price: float
     submitted_at: datetime
     rank: int
+    is_own: bool
 
 
 class RfqSummary(BaseModel):
