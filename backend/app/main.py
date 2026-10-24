@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -12,10 +14,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
+import psycopg
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .auth import (
@@ -29,8 +33,11 @@ from .auth import (
     require_role,
     set_auth_cookies,
 )
-from .database import connection, init_db
-from .schemas import AuctionStatus, BidCreate, LoginRequest, RfqCreate
+from .database import connection, init_db, using_postgres
+from .schemas import (
+    AuctionAction, AuctionStatus, AuctionTransition, BidCreate, LoginRequest,
+    RfqCreate, RfqDetail, RfqSummary,
+)
 from .security import token_hash, verify_password
 
 
@@ -38,7 +45,9 @@ MAX_API_BODY_BYTES = 32 * 1024
 IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 login_limiter = SlidingWindowLimiter(attempts=5, window_seconds=300)
-DUMMY_PASSWORD_HASH = (
+logger = logging.getLogger("gocomet.api")
+# Fixed hash equalizes login timing for unknown emails; it is not an account credential.
+DUMMY_PASSWORD_HASH = (  # nosec B105
     "pbkdf2_sha256$180000$00112233445566778899aabbccddeeff$"
     "974edb851e78b8b609e8c279354cbbd9e2bc633dcf68acfc31561ec2df39392d"
 )
@@ -66,6 +75,9 @@ def parse(value: str) -> datetime:
 
 
 def auction_status(rfq: sqlite3.Row, now: datetime) -> str:
+    lifecycle = rfq["lifecycle_state"] if "lifecycle_state" in rfq.keys() else "published"
+    if lifecycle in {"paused", "cancelled", "awarded"}:
+        return lifecycle
     forced_close = parse(rfq["forced_close_at"])
     current_close = parse(rfq["current_close_at"])
     if now >= forced_close and current_close >= forced_close:
@@ -87,12 +99,12 @@ def ranked_bids(db: sqlite3.Connection, rfq_id: int) -> list[dict]:
             "id": row["id"],
             "supplier_name": row["supplier_name"],
             "carrier_name": row["carrier_name"],
-            "freight_charges": row["freight_charges"],
-            "origin_charges": row["origin_charges"],
-            "destination_charges": row["destination_charges"],
+            "freight_charges": float(row["freight_charges"]),
+            "origin_charges": float(row["origin_charges"]),
+            "destination_charges": float(row["destination_charges"]),
             "transit_time_days": row["transit_time_days"],
             "validity_date": row["validity_date"],
-            "total_price": row["total_price"],
+            "total_price": float(row["total_price"]),
             "submitted_at": row["submitted_at"],
             "bidder_user_id": row["bidder_user_id"],
             "rank": rank,
@@ -127,9 +139,58 @@ def serialize_summary(db: sqlite3.Connection, rfq: sqlite3.Row, now: datetime) -
         "current_close_at": rfq["current_close_at"],
         "forced_close_at": rfq["forced_close_at"],
         "status": auction_status(rfq, now),
-        "lowest_bid": aggregate["lowest_bid"],
+        "lowest_bid": float(aggregate["lowest_bid"]) if aggregate["lowest_bid"] is not None else None,
         "bid_count": aggregate["bid_count"],
+        "lifecycle_state": rfq["lifecycle_state"],
+        "version": rfq["version"],
     }
+
+
+def audit_security(
+    db: sqlite3.Connection,
+    *,
+    action: str,
+    outcome: str,
+    tenant_id: str | None = None,
+    actor_user_id: int | None = None,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    request_id: str | None = None,
+    details: dict | None = None,
+) -> None:
+    db.execute(
+        """INSERT INTO security_audit_log (
+            tenant_id, actor_user_id, action, outcome, resource_type,
+            resource_id, request_id, details_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (tenant_id, actor_user_id, action, outcome, resource_type, resource_id,
+         request_id, json.dumps(details or {}, separators=(",", ":")), iso(utc_now())),
+    )
+
+
+def check_distributed_login_limit(rate_key: str) -> None:
+    if not using_postgres():
+        login_limiter.check(rate_key)
+        return
+    now = utc_now()
+    key_hash = token_hash(rate_key)
+    with connection() as db:
+        db.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (key_hash,))
+        db.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (iso(now - timedelta(minutes=5)),))
+        count = db.execute(
+            "SELECT COUNT(*) AS count FROM login_attempts WHERE key_hash = ?", (key_hash,)
+        ).fetchone()["count"]
+        if count >= 5:
+            raise HTTPException(status_code=429, detail="Too many login attempts", headers={"Retry-After": "300"})
+        db.execute("INSERT INTO login_attempts (key_hash, attempted_at) VALUES (?, ?)", (key_hash, iso(now)))
+
+
+def reset_distributed_login_limit(rate_key: str) -> None:
+    if not using_postgres():
+        login_limiter.reset(rate_key)
+        return
+    with connection() as db:
+        db.execute("DELETE FROM login_attempts WHERE key_hash = ?", (token_hash(rate_key),))
 
 
 def _visible_events(db: sqlite3.Connection, rfq_id: int, viewer: UserContext) -> list[dict]:
@@ -181,7 +242,7 @@ def serialize_detail(
     return payload
 
 
-def _payload_hash(payload: RfqCreate | BidCreate) -> str:
+def _payload_hash(payload: RfqCreate | BidCreate | AuctionTransition) -> str:
     canonical = json.dumps(payload.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -220,6 +281,14 @@ def _replay_or_conflict(
         content=json.loads(row["response_json"]),
         headers={"Idempotency-Replayed": "true"},
     )
+
+
+def _lock_idempotency(db, user_id: int, operation: str, key: str) -> None:
+    if using_postgres():
+        db.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(?))",
+            (f"{user_id}:{operation}:{key}",),
+        )
 
 
 def _store_idempotency(
@@ -280,7 +349,7 @@ app.add_middleware(
     allow_origins=_allowed_origins(),
     allow_credentials=True,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Idempotency-Key", "X-CSRF-Token", "X-Request-ID"],
+    allow_headers=["Content-Type", "Idempotency-Key", "If-Match", "X-CSRF-Token", "X-Request-ID"],
     max_age=600,
 )
 
@@ -293,6 +362,7 @@ async def security_middleware(request: Request, call_next):
         if REQUEST_ID_PATTERN.fullmatch(request_id_header)
         else str(uuid.uuid4())
     )
+    request.state.request_id = request_id
     if request.url.path.startswith("/api/") and request.method in {"POST", "PUT", "PATCH"}:
         raw_length = request.headers.get("content-length")
         try:
@@ -313,7 +383,13 @@ async def security_middleware(request: Request, call_next):
                 headers={"X-Request-ID": request_id},
             )
 
+    started = utc_now()
     response = await call_next(request)
+    duration_ms = round((utc_now() - started).total_seconds() * 1000, 2)
+    logger.info(json.dumps({"event": "http_request", "request_id": request_id,
+        "method": request.method, "path": request.url.path,
+        "status": response.status_code, "duration_ms": duration_ms}, separators=(",", ":")))
+    response.headers["Server-Timing"] = f"app;dur={duration_ms}"
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -346,7 +422,8 @@ async def database_error_handler(_: Request, __: sqlite3.OperationalError) -> JS
 def health() -> dict:
     with connection() as db:
         db.execute("SELECT 1").fetchone()
-    return {"status": "ok", "service": "gocomet-auctions", "version": "2.0.0"}
+    return {"status": "ok", "service": "gocomet-auctions", "version": "3.0.0",
+            "database": "postgresql" if using_postgres() else "sqlite-demo"}
 
 
 @app.post("/api/auth/login")
@@ -354,7 +431,7 @@ def login(payload: LoginRequest, request: Request, response: Response) -> dict:
     email = str(payload.email).lower()
     client_host = request.client.host if request.client else "unknown"
     rate_key = f"{client_host}:{email}"
-    login_limiter.check(rate_key)
+    check_distributed_login_limit(rate_key)
     with connection() as db:
         row = db.execute(
             "SELECT * FROM users WHERE email = ? AND is_active = 1",
@@ -365,11 +442,17 @@ def login(payload: LoginRequest, request: Request, response: Response) -> dict:
         row["password_hash"] if row else DUMMY_PASSWORD_HASH,
     )
     if not row or not valid_password:
+        with connection() as db:
+            audit_security(db, action="auth.login", outcome="denied",
+                request_id=request.state.request_id, details={"email_hash": token_hash(email)})
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
 
     session_token, csrf_token = create_session(row["id"])
     set_auth_cookies(response, session_token, csrf_token)
-    login_limiter.reset(rate_key)
+    reset_distributed_login_limit(rate_key)
+    with connection() as db:
+        audit_security(db, action="auth.login", outcome="success", tenant_id=row["tenant_id"],
+            actor_user_id=row["id"], request_id=request.state.request_id)
     return {
         "user": {
             "id": row["id"],
@@ -378,6 +461,7 @@ def login(payload: LoginRequest, request: Request, response: Response) -> dict:
             "role": row["role"],
             "supplier_name": row["supplier_name"],
             "carrier_name": row["carrier_name"],
+            "tenant_id": row["tenant_id"],
         }
     }
 
@@ -405,7 +489,7 @@ def logout(
 IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=128)]
 
 
-@app.post("/api/rfqs", status_code=status.HTTP_201_CREATED)
+@app.post("/api/rfqs", status_code=status.HTTP_201_CREATED, response_model=RfqDetail)
 def create_rfq(
     payload: RfqCreate,
     idempotency_key: IdempotencyHeader,
@@ -429,9 +513,11 @@ def create_rfq(
         payload.extension_trigger.value,
         user.id,
         iso(now),
+        user.tenant_id,
     )
     with connection() as db:
         db.execute("BEGIN IMMEDIATE")
+        _lock_idempotency(db, user.id, operation, key)
         replay = _replay_or_conflict(db, user.id, operation, key, request_hash)
         if replay:
             return replay
@@ -440,13 +526,14 @@ def create_rfq(
                 """INSERT INTO rfqs (
                     reference_id, name, bid_start_at, original_close_at, current_close_at,
                     forced_close_at, pickup_service_at, trigger_window_minutes,
-                    extension_minutes, extension_trigger, created_by_user_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    extension_minutes, extension_trigger, created_by_user_id, created_at,
+                    tenant_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
                 values,
             )
-        except sqlite3.IntegrityError as exc:
+        except (sqlite3.IntegrityError, psycopg.IntegrityError) as exc:
             raise HTTPException(status_code=409, detail="RFQ reference ID already exists") from exc
-        rfq_id = int(cursor.lastrowid)
+        rfq_id = int(cursor.fetchone()["id"])
         db.execute(
             """INSERT INTO auction_events (
                 rfq_id, event_type, message, metadata_json, created_at
@@ -459,7 +546,7 @@ def create_rfq(
                 iso(now),
             ),
         )
-        rfq = db.execute("SELECT * FROM rfqs WHERE id = ?", (rfq_id,)).fetchone()
+        rfq = db.execute("SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?", (rfq_id, user.tenant_id)).fetchone()
         result = serialize_detail(db, rfq, now, user)
         _store_idempotency(db, user.id, operation, key, request_hash, 201, result)
         return JSONResponse(
@@ -469,19 +556,19 @@ def create_rfq(
         )
 
 
-@app.get("/api/rfqs")
+@app.get("/api/rfqs", response_model=list[RfqSummary])
 def list_rfqs(
     status_filter: AuctionStatus | None = Query(default=None, alias="status"),
     now: datetime | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=10_000),
-    _: UserContext = Depends(current_user),
+    user: UserContext = Depends(current_user),
 ) -> list[dict]:
     moment = as_utc(now) if now else utc_now()
     with connection() as db:
         rows = db.execute(
-            "SELECT * FROM rfqs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            (limit, offset),
+            "SELECT * FROM rfqs WHERE tenant_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (user.tenant_id, limit, offset),
         ).fetchall()
         items = [serialize_summary(db, row, moment) for row in rows]
         if status_filter:
@@ -489,21 +576,156 @@ def list_rfqs(
         return items
 
 
-@app.get("/api/rfqs/{rfq_id}")
+@app.get("/api/rfqs/{rfq_id}", response_model=RfqDetail)
 def get_rfq(
     rfq_id: int,
+    response: Response,
     now: datetime | None = Query(default=None),
     user: UserContext = Depends(current_user),
 ) -> dict:
     moment = as_utc(now) if now else utc_now()
     with connection() as db:
-        rfq = db.execute("SELECT * FROM rfqs WHERE id = ?", (rfq_id,)).fetchone()
+        rfq = db.execute("SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?", (rfq_id, user.tenant_id)).fetchone()
         if not rfq:
             raise HTTPException(status_code=404, detail="RFQ not found")
+        response.headers["ETag"] = f'"{rfq["version"]}"'
         return serialize_detail(db, rfq, moment, user)
 
 
-@app.post("/api/rfqs/{rfq_id}/bids", status_code=status.HTTP_201_CREATED)
+@app.post("/api/rfqs/{rfq_id}/transition", response_model=RfqDetail)
+def transition_rfq(
+    rfq_id: int,
+    payload: AuctionTransition,
+    request: Request,
+    idempotency_key: IdempotencyHeader,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    user: UserContext = Depends(require_role("buyer")),
+    _: UserContext = Depends(require_csrf),
+) -> dict:
+    """Apply an explicitly validated lifecycle transition with optimistic locking."""
+    key = _idempotency_key(idempotency_key)
+    request_hash = _payload_hash(payload)
+    operation = f"transition_rfq:{rfq_id}"
+    with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        _lock_idempotency(db, user.id, operation, key)
+        replay = _replay_or_conflict(db, user.id, operation, key, request_hash)
+        if replay:
+            return replay
+        lock_sql = "SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?"
+        if using_postgres():
+            lock_sql += " FOR UPDATE"
+        rfq = db.execute(lock_sql, (rfq_id, user.tenant_id)).fetchone()
+        if not rfq:
+            raise HTTPException(status_code=404, detail="RFQ not found")
+        if if_match is not None and if_match.strip('"') != str(rfq["version"]):
+            raise HTTPException(status_code=412, detail="Auction was modified; refresh and retry")
+
+        current = auction_status(rfq, utc_now())
+        allowed = {
+            AuctionAction.PAUSE: {"scheduled", "active"},
+            AuctionAction.RESUME: {"paused"},
+            AuctionAction.CANCEL: {"scheduled", "active", "paused", "closed", "force_closed"},
+            AuctionAction.AWARD: {"closed", "force_closed"},
+        }
+        if current not in allowed[payload.action]:
+            raise HTTPException(status_code=409, detail=f"Cannot {payload.action.value} an auction in {current} state")
+
+        next_state = {
+            AuctionAction.PAUSE: "paused",
+            AuctionAction.RESUME: "published",
+            AuctionAction.CANCEL: "cancelled",
+            AuctionAction.AWARD: "awarded",
+        }[payload.action]
+        if payload.action == AuctionAction.AWARD:
+            bid = db.execute(
+                "SELECT id FROM bids WHERE id = ? AND rfq_id = ?", (payload.bid_id, rfq_id)
+            ).fetchone()
+            if not bid:
+                raise HTTPException(status_code=422, detail="Awarded bid does not belong to this auction")
+
+        db.execute(
+            "UPDATE rfqs SET lifecycle_state = ?, awarded_bid_id = ?, version = version + 1 WHERE id = ?",
+            (next_state, payload.bid_id if payload.action == AuctionAction.AWARD else None, rfq_id),
+        )
+        now = utc_now()
+        db.execute(
+            """INSERT INTO auction_events (rfq_id, event_type, message, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (rfq_id, f"auction_{payload.action.value}",
+             f"Auction {next_state}: {payload.reason}",
+             json.dumps({"actor_user_id": user.id, "reason": payload.reason, "bid_id": payload.bid_id}),
+             iso(now)),
+        )
+        audit_security(db, action=f"auction.{payload.action.value}", outcome="success",
+            tenant_id=user.tenant_id, actor_user_id=user.id, resource_type="rfq",
+            resource_id=str(rfq_id), request_id=request.state.request_id,
+            details={"reason": payload.reason, "bid_id": payload.bid_id})
+        updated = db.execute("SELECT * FROM rfqs WHERE id = ?", (rfq_id,)).fetchone()
+        result = serialize_detail(db, updated, now, user)
+        _store_idempotency(db, user.id, operation, key, request_hash, 200, result)
+        return JSONResponse(content=result, headers={"Idempotency-Replayed": "false"})
+
+
+@app.get("/api/rfqs/{rfq_id}/events/stream")
+async def stream_rfq_events(
+    rfq_id: int,
+    request: Request,
+    user: UserContext = Depends(current_user),
+) -> StreamingResponse:
+    with connection() as db:
+        exists = db.execute(
+            "SELECT 1 FROM rfqs WHERE id = ? AND tenant_id = ?", (rfq_id, user.tenant_id)
+        ).fetchone()
+    if not exists:
+        raise HTTPException(status_code=404, detail="RFQ not found")
+
+    async def event_source():
+        last_id = int(request.headers.get("Last-Event-ID", "0") or 0)
+        while not await request.is_disconnected():
+            with connection() as db:
+                rows = db.execute(
+                    """SELECT id, event_type, message, metadata_json, created_at FROM auction_events
+                    WHERE rfq_id = ? AND id > ? ORDER BY id LIMIT 100""", (rfq_id, last_id)
+                ).fetchall()
+            if rows:
+                for row in rows:
+                    last_id = row["id"]
+                    item = dict(row)
+                    metadata = json.loads(item.pop("metadata_json") or "{}")
+                    if user.role == "bidder" and item["event_type"] == "bid_submitted":
+                        item["message"] = (f"You submitted a bid of {metadata.get('total', 0):,.2f}"
+                            if metadata.get("bidder_user_id") == user.id else "A supplier submitted a bid")
+                    data = json.dumps(item, separators=(",", ":"))
+                    yield f"id: {last_id}\nevent: auction\ndata: {data}\n\n"
+            else:
+                yield ": keepalive\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(event_source(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/audit")
+def list_security_audit(
+    limit: int = Query(default=50, ge=1, le=200),
+    user: UserContext = Depends(require_role("buyer")),
+) -> list[dict]:
+    with connection() as db:
+        rows = db.execute(
+            """SELECT id, actor_user_id, action, outcome, resource_type, resource_id,
+            request_id, details_json, created_at FROM security_audit_log
+            WHERE tenant_id = ? ORDER BY id DESC LIMIT ?""", (user.tenant_id, limit)
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["details"] = json.loads(item.pop("details_json"))
+        result.append(item)
+    return result
+
+
+@app.post("/api/rfqs/{rfq_id}/bids", status_code=status.HTTP_201_CREATED, response_model=RfqDetail)
 def submit_bid(
     rfq_id: int,
     payload: BidCreate,
@@ -525,10 +747,14 @@ def submit_bid(
 
     with connection() as db:
         db.execute("BEGIN IMMEDIATE")
+        _lock_idempotency(db, user.id, operation, key)
         replay = _replay_or_conflict(db, user.id, operation, key, request_hash)
         if replay:
             return replay
-        rfq = db.execute("SELECT * FROM rfqs WHERE id = ?", (rfq_id,)).fetchone()
+        lock_sql = "SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?"
+        if using_postgres():
+            lock_sql += " FOR UPDATE"
+        rfq = db.execute(lock_sql, (rfq_id, user.tenant_id)).fetchone()
         if not rfq:
             raise HTTPException(status_code=404, detail="RFQ not found")
         if auction_status(rfq, submitted_at) != "active":
@@ -602,7 +828,7 @@ def submit_bid(
                     "any_rank_change": "supplier ranking changed inside the trigger window",
                     "lowest_bidder_change": "the lowest bidder changed inside the trigger window",
                 }[trigger]
-                db.execute("UPDATE rfqs SET current_close_at = ? WHERE id = ?", (iso(new_close), rfq_id))
+                db.execute("UPDATE rfqs SET current_close_at = ?, version = version + 1 WHERE id = ?", (iso(new_close), rfq_id))
                 db.execute(
                     """INSERT INTO auction_events (
                         rfq_id, event_type, message, metadata_json, created_at
@@ -623,7 +849,7 @@ def submit_bid(
                     ),
                 )
 
-        updated = db.execute("SELECT * FROM rfqs WHERE id = ?", (rfq_id,)).fetchone()
+        updated = db.execute("SELECT * FROM rfqs WHERE id = ? AND tenant_id = ?", (rfq_id, user.tenant_id)).fetchone()
         result = serialize_detail(db, updated, submitted_at, user)
         _store_idempotency(db, user.id, operation, key, request_hash, 201, result)
         return JSONResponse(

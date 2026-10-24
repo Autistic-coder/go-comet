@@ -13,6 +13,9 @@ const statusLabels: Record<AuctionStatus, string> = {
   active: "Live",
   closed: "Closed",
   force_closed: "Force closed",
+  paused: "Paused",
+  cancelled: "Cancelled",
+  awarded: "Awarded",
 };
 
 const triggerLabels: Record<ExtensionTrigger, string> = {
@@ -199,13 +202,13 @@ function BidModal({ auction, user, onClose, onSubmitted }: { auction: AuctionDet
   </section></div>;
 }
 
-function AuctionDetails({ auction, user, now, onBack, onBid }: { auction: AuctionDetail; user: SessionUser; now: number; onBack: () => void; onBid: () => void }) {
+function AuctionDetails({ auction, user, now, onBack, onBid, onTransition }: { auction: AuctionDetail; user: SessionUser; now: number; onBack: () => void; onBid: () => void; onTransition: (action: "pause" | "resume" | "cancel" | "award", bidId?: number) => void }) {
   const progress = Math.min(100, Math.max(0, ((now - new Date(auction.bid_start_at).getTime()) / (new Date(auction.current_close_at).getTime() - new Date(auction.bid_start_at).getTime())) * 100));
   return <main className="content details-view">
     <button className="back-button" onClick={onBack}>← Back to auctions</button>
     <section className="details-hero">
       <div><div className="detail-title-row"><StatusPill status={auction.status} /><span className="rfq-ref">{auction.reference_id}</span></div><h1>{auction.name}</h1><p>Pickup / service · {fmtDate(auction.pickup_service_at)}</p></div>
-      <div className="hero-actions"><div className="big-countdown"><span>Time remaining</span><strong>{countdown(auction.current_close_at, now)}</strong></div>{auction.status === "active" && user.role === "bidder" && <button className="button primary" onClick={onBid}>+ Submit bid</button>}</div>
+      <div className="hero-actions"><div className="big-countdown"><span>Time remaining</span><strong>{countdown(auction.current_close_at, now)}</strong></div>{auction.status === "active" && user.role === "bidder" && <button className="button primary" onClick={onBid}>+ Submit bid</button>}{user.role === "buyer" && (auction.status === "active" || auction.status === "scheduled") && <button className="button secondary" onClick={() => onTransition("pause")}>Pause</button>}{user.role === "buyer" && auction.status === "paused" && <button className="button primary" onClick={() => onTransition("resume")}>Resume</button>}{user.role === "buyer" && !["cancelled", "awarded"].includes(auction.status) && <button className="button secondary" onClick={() => onTransition("cancel")}>Cancel</button>}{user.role === "buyer" && ["closed", "force_closed"].includes(auction.status) && auction.bids[0] && <button className="button primary" onClick={() => onTransition("award", auction.bids[0].id)}>Award L1</button>}</div>
     </section>
     <div className="progress-track"><div style={{ width: `${progress}%` }} /><span className="trigger-marker">Trigger window</span></div>
     <section className="stat-row">
@@ -248,6 +251,10 @@ export default function App() {
   }, []);
   useEffect(() => { void load(); }, [load]);
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
+  useEffect(() => {
+    if (!selected) return;
+    return api.watchAuction(selected.id, () => { void api.getAuction(selected.id).then(setSelected); });
+  }, [selected?.id]);
 
   const visible = useMemo(() => auctions.filter((auction) => `${auction.name} ${auction.reference_id}`.toLowerCase().includes(query.toLowerCase())), [auctions, query]);
   const liveCount = auctions.filter((auction) => auction.status === "active").length;
@@ -255,6 +262,13 @@ export default function App() {
 
   async function openAuction(id: number) { try { setSelected(await api.getAuction(id)); } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not load RFQ"); } }
   function handleUpdated(detail: AuctionDetail) { setSelected(detail); setBidOpen(false); void load(); }
+  async function transitionSelected(action: "pause" | "resume" | "cancel" | "award", bidId?: number) {
+    if (!selected) return;
+    const reason = window.prompt(`Reason to ${action} this auction:`);
+    if (!reason) return;
+    try { handleUpdated(await api.transitionAuction(selected.id, selected.version, action, reason, bidId)); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Transition failed"); }
+  }
 
   async function logout() {
     try { await api.logout(); } finally {
@@ -271,7 +285,7 @@ export default function App() {
     <aside className="sidebar"><div className="brand"><span className="brand-mark">G</span><strong>GoComet</strong></div><p className="brand-caption">Freight intelligence</p><nav aria-label="Main navigation"><button type="button" className="active" aria-current="page"><span>01</span>Auctions</button><button type="button"><span>02</span>RFQs</button><button type="button"><span>03</span>Suppliers</button><button type="button"><span>04</span>Analytics</button></nav><div className="sidebar-bottom"><button type="button" onClick={() => void logout()}><span>05</span>Sign out</button><div className="profile"><div className="avatar">{user.display_name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div><div><strong>{user.display_name}</strong><span>{user.role === "buyer" ? "Buyer administrator" : user.supplier_name}</span></div></div></div></aside>
     <div className="main-shell">
       <header className="topbar"><div className="mobile-brand"><span className="brand-mark">G</span><strong>GoComet</strong></div><div className="topbar-title"><span>Workspace <b>/</b> {user.role === "buyer" ? "Procurement" : "Supplier portal"}</span><strong>Live auction desk</strong></div><div className="topbar-actions"><span className="role-badge">{user.role}</span><span className="system-state"><i /> Market online</span>{user.role === "buyer" && <button className="button primary" onClick={() => setCreateOpen(true)}>New auction <span aria-hidden="true">↗</span></button>}</div></header>
-      {selected ? <AuctionDetails auction={selected} user={user} now={now} onBack={() => setSelected(null)} onBid={() => setBidOpen(true)} /> : <main className="content">
+      {selected ? <AuctionDetails auction={selected} user={user} now={now} onBack={() => setSelected(null)} onBid={() => setBidOpen(true)} onTransition={(action, bidId) => void transitionSelected(action, bidId)} /> : <main className="content">
         <section className="page-heading"><div><span className="eyebrow">Freight procurement · live intelligence</span><h1>{user.role === "buyer" ? <>Better rates,<br/><em>decided in real time.</em></> : <>Qualified lanes,<br/><em>ready for your bid.</em></>}</h1><p>{user.role === "buyer" ? "Run transparent British auctions, compare qualified carriers, and turn every bid into measurable savings." : "Review open freight opportunities and submit quotes through your verified supplier identity."}</p></div>{user.role === "buyer" && <button className="button primary mobile-new" onClick={() => setCreateOpen(true)}>New auction <span aria-hidden="true">↗</span></button>}</section>
         <section className="metrics"><article className="metric-primary"><div><span>Live auctions</span><strong>{liveCount}</strong><small>competitive events running now</small></div><div className="pulse-orbit"><i /><b /></div></article><article><span>Supplier quotes</span><strong>{auctions.reduce((sum, auction) => sum + auction.bid_count, 0)}</strong><small>offers across active lanes</small></article><article><span>Estimated savings</span><strong>{currency.format(totalSavings)}</strong><small className="positive">↗ created through competition</small></article></section>
         <section className="auction-section"><header className="section-title"><div><span className="eyebrow">Auction portfolio</span><h2>Current events</h2></div><span>{visible.length.toString().padStart(2, "0")} records</span></header><div className="list-controls"><div className="tabs">{["all", "active", "scheduled", "closed", "force_closed"].map((value) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{value === "all" ? "All auctions" : statusLabels[value as AuctionStatus]}</button>)}</div><div className="search"><span>⌕</span><input aria-label="Search auctions" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search RFQ or lane" /></div></div>

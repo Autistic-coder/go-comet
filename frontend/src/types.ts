@@ -1,4 +1,5 @@
-export type AuctionStatus = "scheduled" | "active" | "closed" | "force_closed";
+export type AuctionStatus = "scheduled" | "active" | "closed" | "force_closed" | "paused" | "cancelled" | "awarded";
+export type AuctionAction = "pause" | "resume" | "cancel" | "award";
 export type ExtensionTrigger = "bid_received" | "any_rank_change" | "lowest_bidder_change";
 export type UserRole = "buyer" | "bidder";
 
@@ -9,6 +10,7 @@ export interface SessionUser {
   role: UserRole;
   supplier_name: string | null;
   carrier_name: string | null;
+  tenant_id: string;
 }
 
 export interface AuctionSummary {
@@ -21,6 +23,8 @@ export interface AuctionSummary {
   status: AuctionStatus;
   lowest_bid: number | null;
   bid_count: number;
+  lifecycle_state: string;
+  version: number;
 }
 
 export interface Bid {

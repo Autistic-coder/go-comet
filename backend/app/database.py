@@ -7,6 +7,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
+import psycopg
+from psycopg.rows import dict_row
+
 from .security import hash_password
 
 
@@ -25,8 +28,45 @@ def get_db_path() -> Path:
     return Path(os.getenv("RFQ_DATABASE_PATH", str(DEFAULT_DB_PATH)))
 
 
+def using_postgres() -> bool:
+    return os.getenv("DATABASE_URL", "").startswith(("postgres://", "postgresql://"))
+
+
+class PostgresConnection:
+    """Small compatibility adapter while the domain remains database-driver agnostic."""
+
+    def __init__(self, raw: psycopg.Connection):
+        self.raw = raw
+
+    def execute(self, sql: str, params=()):
+        if sql.strip().upper() == "BEGIN IMMEDIATE":
+            sql = "BEGIN"
+        return self.raw.execute(sql.replace("?", "%s"), params)
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+    def close(self):
+        self.raw.close()
+
+
 @contextmanager
-def connection() -> Iterator[sqlite3.Connection]:
+def connection() -> Iterator[sqlite3.Connection | PostgresConnection]:
+    if using_postgres():
+        raw = psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row, connect_timeout=10)
+        db = PostgresConnection(raw)
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        return
     path = get_db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, check_same_thread=False, timeout=10)
@@ -47,6 +87,15 @@ def connection() -> Iterator[sqlite3.Connection]:
 
 def init_db() -> None:
     with connection() as db:
+        if using_postgres():
+            _init_postgres(db)
+            seed_mock_users(db)
+            retention_cutoff = _stamp(datetime.now(timezone.utc) - timedelta(hours=24))
+            db.execute("DELETE FROM idempotency_records WHERE created_at < ?", (retention_cutoff,))
+            db.execute("DELETE FROM sessions WHERE expires_at <= ?", (_stamp(datetime.now(timezone.utc)),))
+            if _demo_data_enabled():
+                seed_demo_data(db)
+            return
         db.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -147,16 +196,121 @@ def init_db() -> None:
             seed_demo_data(db)
 
 
+def _init_postgres(db: PostgresConnection) -> None:
+    statements = [
+        """CREATE TABLE IF NOT EXISTS users (
+            id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('buyer','bidder')), supplier_name TEXT,
+            carrier_name TEXT, password_hash TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'demo-logistics')""",
+        """CREATE TABLE IF NOT EXISTS sessions (
+            id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE, csrf_hash TEXT NOT NULL, expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS rfqs (
+            id BIGSERIAL PRIMARY KEY, reference_id TEXT NOT NULL, name TEXT NOT NULL,
+            bid_start_at TEXT NOT NULL, original_close_at TEXT NOT NULL, current_close_at TEXT NOT NULL,
+            forced_close_at TEXT NOT NULL, pickup_service_at TEXT NOT NULL,
+            trigger_window_minutes INTEGER NOT NULL CHECK (trigger_window_minutes > 0),
+            extension_minutes INTEGER NOT NULL CHECK (extension_minutes > 0), extension_trigger TEXT NOT NULL,
+            created_by_user_id BIGINT REFERENCES users(id), created_at TEXT NOT NULL,
+            tenant_id TEXT NOT NULL DEFAULT 'demo-logistics', lifecycle_state TEXT NOT NULL DEFAULT 'published',
+            bid_visibility TEXT NOT NULL DEFAULT 'exact_price', awarded_bid_id BIGINT, version INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(tenant_id, reference_id))""",
+        """CREATE TABLE IF NOT EXISTS bids (
+            id BIGSERIAL PRIMARY KEY, rfq_id BIGINT NOT NULL REFERENCES rfqs(id) ON DELETE CASCADE,
+            supplier_name TEXT NOT NULL, carrier_name TEXT NOT NULL,
+            freight_charges NUMERIC(18,2) NOT NULL CHECK (freight_charges >= 0),
+            origin_charges NUMERIC(18,2) NOT NULL CHECK (origin_charges >= 0),
+            destination_charges NUMERIC(18,2) NOT NULL CHECK (destination_charges >= 0),
+            transit_time_days INTEGER NOT NULL CHECK (transit_time_days > 0), validity_date TEXT NOT NULL,
+            total_price NUMERIC(18,2) NOT NULL CHECK (total_price >= 0), bidder_user_id BIGINT REFERENCES users(id),
+            submitted_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS auction_events (
+            id BIGSERIAL PRIMARY KEY, rfq_id BIGINT NOT NULL REFERENCES rfqs(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL, message TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS idempotency_records (
+            id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            operation TEXT NOT NULL, idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL,
+            response_status INTEGER NOT NULL, response_json TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(user_id, operation, idempotency_key))""",
+        """CREATE TABLE IF NOT EXISTS security_audit_log (
+            id BIGSERIAL PRIMARY KEY, tenant_id TEXT, actor_user_id BIGINT REFERENCES users(id),
+            action TEXT NOT NULL, outcome TEXT NOT NULL, resource_type TEXT, resource_id TEXT,
+            request_id TEXT, ip_hash TEXT, details_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS login_attempts (
+            id BIGSERIAL PRIMARY KEY, key_hash TEXT NOT NULL, attempted_at TEXT NOT NULL)""",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_token_expiry ON sessions(token_hash, expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_rfqs_tenant_created ON rfqs(tenant_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_bids_rfq_price ON bids(rfq_id, total_price, submitted_at)",
+        "CREATE INDEX IF NOT EXISTS idx_events_rfq_created ON auction_events(rfq_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_records(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_security_audit_tenant_created ON security_audit_log(tenant_id, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_login_attempts_key_time ON login_attempts(key_hash, attempted_at)",
+    ]
+    for statement in statements:
+        db.execute(statement)
+    db.execute(
+        """DO $$ BEGIN ALTER TABLE rfqs ADD CONSTRAINT fk_rfqs_awarded_bid
+        FOREIGN KEY (awarded_bid_id) REFERENCES bids(id); EXCEPTION WHEN duplicate_object THEN NULL; END $$"""
+    )
+
+
 def _column_names(db: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
 def _migrate_legacy_schema(db: sqlite3.Connection) -> None:
+    user_columns = _column_names(db, "users")
+    if "tenant_id" not in user_columns:
+        db.execute("ALTER TABLE users ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'demo-logistics'")
     if "created_by_user_id" not in _column_names(db, "rfqs"):
         db.execute("ALTER TABLE rfqs ADD COLUMN created_by_user_id INTEGER REFERENCES users(id)")
+    rfq_columns = _column_names(db, "rfqs")
+    if "tenant_id" not in rfq_columns:
+        db.execute("ALTER TABLE rfqs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'demo-logistics'")
+    if "lifecycle_state" not in rfq_columns:
+        db.execute("ALTER TABLE rfqs ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'published'")
+    if "bid_visibility" not in rfq_columns:
+        db.execute("ALTER TABLE rfqs ADD COLUMN bid_visibility TEXT NOT NULL DEFAULT 'exact_price'")
+    if "awarded_bid_id" not in rfq_columns:
+        db.execute("ALTER TABLE rfqs ADD COLUMN awarded_bid_id INTEGER REFERENCES bids(id)")
+    if "version" not in rfq_columns:
+        db.execute("ALTER TABLE rfqs ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
     if "bidder_user_id" not in _column_names(db, "bids"):
         db.execute("ALTER TABLE bids ADD COLUMN bidder_user_id INTEGER REFERENCES users(id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_rfqs_tenant_created ON rfqs(tenant_id, created_at DESC)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_users_tenant_role ON users(tenant_id, role)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_bids_bidder ON bids(bidder_user_id, submitted_at DESC)")
+
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS security_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT,
+            actor_user_id INTEGER REFERENCES users(id),
+            action TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            resource_type TEXT,
+            resource_id TEXT,
+            request_id TEXT,
+            ip_hash TEXT,
+            details_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        )"""
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_security_audit_tenant_created "
+        "ON security_audit_log(tenant_id, created_at DESC)"
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_hash TEXT NOT NULL,
+            attempted_at TEXT NOT NULL
+        )"""
+    )
+    db.execute("CREATE INDEX IF NOT EXISTS idx_login_attempts_key_time ON login_attempts(key_hash, attempted_at)")
 
 
 def seed_mock_users(db: sqlite3.Connection) -> None:
@@ -268,7 +422,7 @@ def seed_demo_data(db: sqlite3.Connection) -> None:
                 reference_id, name, bid_start_at, original_close_at, current_close_at,
                 forced_close_at, pickup_service_at, trigger_window_minutes,
                 extension_minutes, extension_trigger, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (
                 auction["reference_id"], auction["name"], _stamp(auction["bid_start_at"]),
                 _stamp(auction["original_close_at"]), _stamp(auction["current_close_at"]),
@@ -277,10 +431,11 @@ def seed_demo_data(db: sqlite3.Connection) -> None:
                 auction["extension_trigger"], _stamp(auction["created_at"]),
             ),
         )
-        ids[auction["reference_id"]] = int(cursor.lastrowid)
+        new_id = int(cursor.fetchone()["id"])
+        ids[auction["reference_id"]] = new_id
         db.execute(
             "INSERT INTO auction_events (rfq_id, event_type, message, metadata_json, created_at) VALUES (?, ?, ?, '{}', ?)",
-            (cursor.lastrowid, "auction_created", "British auction created", _stamp(auction["created_at"])),
+            (new_id, "auction_created", "British auction created", _stamp(auction["created_at"])),
         )
 
     def add_bid(

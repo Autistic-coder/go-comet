@@ -22,6 +22,30 @@ class AuctionStatus(str, Enum):
     ACTIVE = "active"
     CLOSED = "closed"
     FORCE_CLOSED = "force_closed"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+    AWARDED = "awarded"
+
+
+class AuctionAction(str, Enum):
+    PAUSE = "pause"
+    RESUME = "resume"
+    CANCEL = "cancel"
+    AWARD = "award"
+
+
+class AuctionTransition(StrictModel):
+    action: AuctionAction
+    reason: str = Field(min_length=3, max_length=500)
+    bid_id: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def award_requires_bid(self) -> "AuctionTransition":
+        if self.action == AuctionAction.AWARD and self.bid_id is None:
+            raise ValueError("Awarding an auction requires a bid_id")
+        if self.action != AuctionAction.AWARD and self.bid_id is not None:
+            raise ValueError("bid_id is only valid for an award action")
+        return self
 
 
 class LoginRequest(StrictModel):
@@ -111,6 +135,8 @@ class RfqSummary(BaseModel):
     status: str
     lowest_bid: float | None
     bid_count: int
+    lifecycle_state: str
+    version: int
 
 
 class RfqDetail(RfqSummary):

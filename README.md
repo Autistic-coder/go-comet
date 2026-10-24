@@ -28,6 +28,11 @@ These credentials are intentionally public. The mock login exercises server-side
 - Buyer and bidder role separation
 - Idempotent RFQ creation and bid submission
 - HttpOnly sessions, CSRF validation, login throttling, and secure response headers
+- Tenant-scoped authorization and data access
+- Pause, resume, cancel, and award lifecycle controls with optimistic locking
+- PostgreSQL production mode with row-level auction locks
+- Real-time server-sent auction events
+- Security audit ledger, structured request logs, and server timing
 
 The interface uses the visual language of the MindMesh AI/ML workspace: warm paper surfaces, charcoal navigation, lime highlights, editorial serif headings, and compact data-focused labels.
 
@@ -50,8 +55,8 @@ Set `SEED_DEMO_DATA=true` to insert the sample records into an empty database. E
 | --- | --- |
 | Frontend | React 19, TypeScript, Vite, responsive CSS |
 | Backend | FastAPI, Pydantic |
-| Database | SQLite |
-| Testing | Pytest, FastAPI TestClient |
+| Database | PostgreSQL production mode; SQLite demo fallback |
+| Testing | 22 Pytest API, security, auction, and lifecycle checks |
 | Production | Multi-stage Docker container |
 | Hosting | Vercel and Render configuration included |
 
@@ -63,14 +68,14 @@ flowchart LR
     R -->|Session + CSRF + Idempotency-Key| A[FastAPI]
     A --> G[Auth and role guard]
     G --> E[Auction engine]
-    E --> D[(SQLite)]
+    E --> D[(PostgreSQL / SQLite demo)]
     E --> L[Audit events]
     A --> I[Idempotency ledger]
     I --> D
     L --> D
 ```
 
-FastAPI owns identity, authorization, auction status, totals, ranking, extension decisions, and privacy filtering. Writes use a SQLite `BEGIN IMMEDIATE` transaction so the bid, extension, audit records, and idempotency response commit together.
+FastAPI owns identity, tenant authorization, auction state, totals, ranking, extension decisions, and privacy filtering. PostgreSQL production writes lock the target RFQ row with `SELECT ... FOR UPDATE`; SQLite demo writes use `BEGIN IMMEDIATE`. The bid, extension, audit records, and idempotency response commit together.
 
 Read the full [architecture document](docs/architecture.md).
 
@@ -135,6 +140,7 @@ For a separately hosted backend, provide its origin through `VITE_API_URL`.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `RFQ_DATABASE_PATH` | `backend/rfq.db` | Location of the SQLite database |
+| `DATABASE_URL` | unset | PostgreSQL connection URL; takes precedence over SQLite |
 | `SEED_DEMO_DATA` | `false` | Adds demonstration auctions when the database is empty |
 | `AUTH_COOKIE_SECURE` | `false` locally | Sends authentication cookies only over HTTPS when enabled |
 | `ALLOWED_HOSTS` | Localhost plus deployment hosts | Comma-separated trusted Host values |
@@ -170,6 +176,9 @@ The API rejects bids outside the active interval. Every bid submission and aucti
 | `POST` | `/api/rfqs` | Create an auction; buyer + CSRF + idempotency required |
 | `GET` | `/api/rfqs/{id}` | Get auction details, bids, and events |
 | `POST` | `/api/rfqs/{id}/bids` | Submit a bid; bidder + CSRF + idempotency required |
+| `POST` | `/api/rfqs/{id}/transition` | Pause, resume, cancel, or award; buyer + CSRF + idempotency required |
+| `GET` | `/api/rfqs/{id}/events/stream` | Redacted real-time auction event stream |
+| `GET` | `/api/audit` | Tenant-scoped security audit records for buyers |
 
 The generated OpenAPI reference is available at `/docs` whenever the backend is running.
 
@@ -181,7 +190,7 @@ The production project is connected to the repository's `main` branch. Every pus
 
 `Dockerfile.vercel` builds the React application and packages it with FastAPI as a Vercel container. The frontend and API are served from the same origin.
 
-Vercel Functions use ephemeral storage. The included SQLite database is suitable for demonstration data, but production auctions should use durable PostgreSQL storage.
+Vercel Functions use ephemeral storage. The hosted public demonstration can run with disposable SQLite seed data; set `DATABASE_URL` to a managed PostgreSQL database for durable sessions, auctions, audit logs, and cross-instance idempotency.
 
 ### Render
 
@@ -196,7 +205,7 @@ The free Blueprint uses ephemeral SQLite storage. For persistent data, attach a 
 ```text
 backend/
   app/
-    database.py       SQLite setup and demonstration records
+    database.py       PostgreSQL/SQLite adapters, schema, and demo records
     auth.py           Sessions, CSRF, roles, and login throttling
     main.py           FastAPI routes, middleware, and auction rules
     schemas.py        Request and response models
@@ -214,6 +223,8 @@ docs/
   architecture.md     Trust boundaries and request flows
   schema.md           Complete schema, constraints, and indexes
   design.md           Security decisions and production limitations
+  threat-model.md     STRIDE threats, abuse cases, and remaining controls
+  runbook.md          SLOs, incident response, recovery, and safe deployment
 Dockerfile            Render-compatible production image
 Dockerfile.vercel     Vercel container image
 render.yaml           Render Blueprint
@@ -230,4 +241,8 @@ cd ..\frontend
 npm run build
 ```
 
-The backend currently runs 19 checks covering bid ranking, forced-close enforcement, password storage, authentication, authorization, CSRF, login rate limits, session logout and expiry, required idempotency keys, idempotent replay, idempotency conflicts, supplier privacy, strict payload validation, pagination bounds, trusted hosts, security headers, request IDs, request-size limits, and demonstration-data seeding.
+The backend runs 22 checks covering bid ranking, forced-close enforcement, password storage, authentication, authorization, CSRF, throttling, sessions, idempotency, privacy, validation, security headers, demonstration seeding, lifecycle transitions, optimistic locking, award integrity, and audit creation. CI additionally compiles Python, checks dependency consistency, audits Python and npm dependencies, runs Bandit, builds React, and builds both deployment containers.
+
+## Production-readiness boundary
+
+The public login remains intentionally mocked so recruiters can evaluate both roles without provisioning an account. Before handling real commercial data, connect a managed identity provider with MFA and organization membership, configure PostgreSQL through `DATABASE_URL`, export audit logs to append-only storage, configure alerts, and perform a restore drill. PostgreSQL mode shares login throttling across instances; Redis remains an optional higher-throughput replacement. See the [threat model](docs/threat-model.md) and [operations runbook](docs/runbook.md).

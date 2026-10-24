@@ -6,6 +6,7 @@ erDiagram
     USERS ||--o{ RFQS : creates
     USERS ||--o{ BIDS : submits
     USERS ||--o{ IDEMPOTENCY_RECORDS : scopes
+    USERS ||--o{ SECURITY_AUDIT_LOG : acts
     RFQS ||--o{ BIDS : receives
     RFQS ||--o{ AUCTION_EVENTS : records
 
@@ -18,6 +19,7 @@ erDiagram
       text carrier_name
       text password_hash
       boolean is_active
+      text tenant_id
       datetime created_at
     }
     SESSIONS {
@@ -42,6 +44,11 @@ erDiagram
       integer extension_minutes
       text extension_trigger
       integer created_by_user_id FK
+      text tenant_id
+      text lifecycle_state
+      text bid_visibility
+      integer awarded_bid_id FK
+      integer version
       datetime created_at
     }
     BIDS {
@@ -76,6 +83,18 @@ erDiagram
       json response_json
       datetime created_at
     }
+    SECURITY_AUDIT_LOG {
+      integer id PK
+      text tenant_id
+      integer actor_user_id FK
+      text action
+      text outcome
+      text resource_type
+      text resource_id
+      text request_id
+      json details_json
+      datetime created_at
+    }
 ```
 
 ## Integrity rules
@@ -87,6 +106,8 @@ erDiagram
 - Bid charges must be non-negative and transit time must be positive.
 - Auction extension policies are constrained to the three supported trigger values.
 - `(user_id, operation, idempotency_key)` is unique, preventing duplicate mutation processing.
+- Tenant ownership comes from the authenticated session and scopes all RFQ reads and writes.
+- The RFQ `version` supports optimistic concurrency for lifecycle decisions.
 - Foreign keys cascade session and idempotency cleanup when a user is removed.
 - RFQ deletion cascades bids and auction events.
 
@@ -99,7 +120,9 @@ erDiagram
 | `bids(bidder_user_id, submitted_at)` | Bidder activity lookup |
 | `auction_events(rfq_id, created_at)` | Reverse chronological audit trail |
 | `idempotency_records(created_at)` | 24-hour retention and cleanup operations |
+| `rfqs(tenant_id, created_at)` | Tenant isolation and portfolio ordering |
+| `security_audit_log(tenant_id, created_at)` | Tenant-scoped security investigations |
 
 ## Migration behavior
 
-`init_db()` creates all tables for a new installation and adds ownership columns to databases created by earlier versions. Demo records are inserted only when `SEED_DEMO_DATA=true` and the RFQ table is empty.
+`init_db()` creates the PostgreSQL or SQLite schema and upgrades older SQLite demos with additive columns. Demo records are inserted only when `SEED_DEMO_DATA=true` and the RFQ table is empty. Production schema changes should be deployed with an expand/migrate/contract migration process before application promotion.

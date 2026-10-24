@@ -10,7 +10,7 @@ flowchart LR
     A --> M[Security middleware]
     M --> AU[Authentication and RBAC]
     AU --> E[Auction engine]
-    E --> D[(SQLite relational store)]
+    E --> D[(PostgreSQL production / SQLite demo)]
     E --> L[Append-only activity log]
     A --> I[Idempotency ledger]
     I --> D
@@ -25,7 +25,8 @@ The React and FastAPI applications are built into one container and served from 
 2. A random session token is stored only in an HttpOnly, SameSite=Strict cookie. Only its SHA-256 digest is stored in the database.
 3. State-changing requests must also supply the matching CSRF token and a valid idempotency key.
 4. Buyer-only and bidder-only operations are enforced in FastAPI, not only hidden in React.
-5. SQLite transactions use `BEGIN IMMEDIATE` around write decisions so a bid, extension, audit entry, and idempotency record commit together.
+5. Every business query is scoped by the authenticated tenant. PostgreSQL transactions lock the RFQ row; SQLite demo transactions use `BEGIN IMMEDIATE`.
+6. Lifecycle writes use optimistic versions and an idempotency key. SSE applies the same supplier redaction as REST.
 
 ## Login and authorization flow
 
@@ -33,7 +34,7 @@ The React and FastAPI applications are built into one container and served from 
 sequenceDiagram
     participant UI as React UI
     participant API as FastAPI
-    participant DB as SQLite
+    participant DB as Relational store
     UI->>API: POST /api/auth/login
     API->>API: Rate limit by IP + email
     API->>DB: Load active user
@@ -81,8 +82,9 @@ sequenceDiagram
 - `Dockerfile.vercel` produces the Vercel container deployment.
 - `Dockerfile` and `render.yaml` support Render.
 - React build assets are served by FastAPI after all API routes.
-- SQLite is intentionally zero-setup for this demonstration. Production persistence should use PostgreSQL with row-level locks and shared rate-limit storage.
+- `DATABASE_URL` activates PostgreSQL and row-level auction locking; otherwise the zero-setup SQLite demonstration mode is used.
+- A production deployment still requires shared rate-limit storage and a managed identity provider.
 
 ## Observability
 
-Every response includes `X-Request-ID`. Auction mutations create immutable business events containing actor identifiers in metadata. Operational database failures return a generic 503 with `Retry-After`; internal exception details are not sent to clients.
+Every response includes `X-Request-ID` and `Server-Timing`. Structured JSON request logs include route, status, duration, and request ID. Auction mutations create business events while security-sensitive actions enter a tenant-scoped audit ledger. Operational database failures return a generic 503 with `Retry-After`; internal details and secrets are not sent to clients.

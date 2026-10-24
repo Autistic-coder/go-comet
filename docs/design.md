@@ -14,6 +14,7 @@ The demonstration should make buyer and bidder responsibilities obvious while en
 | Submit a bid | No | Yes |
 | Choose the supplier identity sent with a bid | No | No |
 | Read the audit timeline | Full | Redacted supplier messages |
+| Pause/resume/cancel/award | Yes | No |
 
 The frontend uses role-aware controls for clarity. FastAPI independently enforces every permission and returns 403 when a user attempts an action outside their role.
 
@@ -71,7 +72,7 @@ Successful responses remain replayable for 24 hours; older ledger entries are re
 - A write lock covers the previous ranking, bid insert, new ranking, extension decision, events, and idempotency response.
 - Extensions are capped with `min(current close + extension duration, forced close)`.
 
-SQLite's write lock is sufficient for the demonstration. PostgreSQL production deployments should use a transaction plus `SELECT ... FOR UPDATE` on the RFQ row.
+SQLite's write lock is sufficient for the demonstration. When `DATABASE_URL` is set, PostgreSQL uses a transaction plus `SELECT ... FOR UPDATE` on the RFQ row. Auction transitions also check an `If-Match` version to reject stale buyer actions.
 
 ## Input and transport controls
 
@@ -91,8 +92,8 @@ Buyers receive the complete ranking. Bidders receive their own identity but comp
 
 ## Known demonstration limits
 
-- SQLite and the in-process login limiter are local to one container instance.
+- SQLite demo mode and its in-process login limiter are local to one container instance; PostgreSQL mode uses a shared attempt ledger and advisory transaction lock.
 - Public mock credentials provide workflow separation, not real account security.
-- The frontend currently polls by reload rather than using WebSockets or server-sent events.
+- Server-sent events provide live refresh; large deployments should add a shared event broker rather than depending on database polling per connection.
 - Durable production operation requires PostgreSQL and shared rate-limit storage such as Redis.
 - Real authentication should add account recovery, MFA, organization membership, and identity-provider audit logs.

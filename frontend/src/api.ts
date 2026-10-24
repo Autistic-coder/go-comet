@@ -1,4 +1,4 @@
-import type { AuctionDetail, AuctionSummary, SessionUser } from "./types";
+import type { AuctionAction, AuctionDetail, AuctionSummary, SessionUser } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
 
@@ -65,5 +65,20 @@ export const api = {
     mutation<AuctionDetail>("/api/rfqs", payload),
   submitBid: (id: number, payload: Record<string, unknown>) =>
     mutation<AuctionDetail>(`/api/rfqs/${id}/bids`, payload),
+  transitionAuction: (id: number, version: number, action: AuctionAction, reason: string, bidId?: number) =>
+    request<AuctionDetail>(`/api/rfqs/${id}/transition`, {
+      method: "POST",
+      headers: {
+        "If-Match": String(version),
+        "Idempotency-Key": crypto.randomUUID(),
+        "X-CSRF-Token": decodeURIComponent(cookie("gocomet_csrf") ?? ""),
+      },
+      body: JSON.stringify({ action, reason, bid_id: bidId }),
+    }),
+  watchAuction: (id: number, onEvent: () => void) => {
+    const source = new EventSource(`${API_BASE}/api/rfqs/${id}/events/stream`, { withCredentials: true });
+    source.addEventListener("auction", onEvent);
+    return () => source.close();
+  },
 };
 

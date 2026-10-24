@@ -38,6 +38,7 @@ class UserContext:
     role: str
     supplier_name: str | None
     carrier_name: str | None
+    tenant_id: str
     csrf_hash: str
 
     def public(self) -> dict:
@@ -48,6 +49,7 @@ class UserContext:
             "role": self.role,
             "supplier_name": self.supplier_name,
             "carrier_name": self.carrier_name,
+            "tenant_id": self.tenant_id,
         }
 
 
@@ -100,6 +102,7 @@ def current_user(request: Request) -> UserContext:
         row = db.execute(
             """SELECT
                 u.id, u.email, u.display_name, u.role, u.supplier_name, u.carrier_name,
+                u.tenant_id,
                 u.is_active, s.id AS session_id, s.csrf_hash, s.expires_at, s.last_seen_at
             FROM sessions s
             JOIN users u ON u.id = s.user_id
@@ -123,6 +126,7 @@ def current_user(request: Request) -> UserContext:
         role=row["role"],
         supplier_name=row["supplier_name"],
         carrier_name=row["carrier_name"],
+        tenant_id=row["tenant_id"],
         csrf_hash=row["csrf_hash"],
     )
 
