@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 
-from prometheus_client import Counter, Histogram, make_asgi_app
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from starlette.responses import Response
 
 HTTP_REQUESTS = Counter("gocomet_http_requests_total", "HTTP requests", ("method", "route", "status"))
 HTTP_DURATION = Histogram("gocomet_http_request_duration_seconds", "HTTP request duration", ("method", "route"))
@@ -11,7 +12,14 @@ EXTENSIONS = Counter("gocomet_auction_extensions_total", "Auction extensions", (
 
 
 def configure_telemetry(app) -> None:
-    app.mount("/metrics", make_asgi_app())
+    # A concrete route avoids a trailing-slash redirect being swallowed by the
+    # SPA catch-all on container platforms.
+    app.add_api_route(
+        "/metrics",
+        lambda: Response(generate_latest(), media_type=CONTENT_TYPE_LATEST),
+        methods=["GET"],
+        include_in_schema=False,
+    )
     if not os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
         return
     from opentelemetry import trace
