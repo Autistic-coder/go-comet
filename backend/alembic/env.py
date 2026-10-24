@@ -16,7 +16,10 @@ def run_migrations_online() -> None:
     if url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
     engine = create_engine(url, poolclass=pool.NullPool, connect_args={"connect_timeout": 10})
-    with engine.connect() as connection:
+    # The explicit outer transaction is essential: taking the session advisory
+    # lock autobegins a SQLAlchemy transaction, so relying only on Alembic's
+    # context transaction would roll all DDL back when the connection closes.
+    with engine.begin() as connection:
         connection.exec_driver_sql("SELECT pg_advisory_lock(hashtext('gocomet_alembic'))")
         context.configure(connection=connection, target_metadata=None, compare_type=True)
         try:
