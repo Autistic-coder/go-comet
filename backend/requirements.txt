@@ -7,7 +7,7 @@ httpx==0.28.1
 psycopg[binary]>=3.2,<4
 psycopg-pool>=3.2,<4
 alembic>=1.14,<2
-SQLAlchemy>=2.0,<3
+SQLAlchemy>=2.1.5,<3
 prometheus-client>=0.21,<1
 opentelemetry-api>=1.29,<2
 opentelemetry-sdk>=1.29,<2
